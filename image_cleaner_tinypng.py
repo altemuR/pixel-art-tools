@@ -38,15 +38,28 @@ def save_config(data: dict):
 # ──────────────────────────────────────────────────────────────────────────────
 #  Shared tinify helper
 # ──────────────────────────────────────────────────────────────────────────────
-def tinify_file(path: str, api_key: str):
-    """Compress a single file in-place with TinyPNG. Returns (ok, error_str)."""
+def tinified_path(p: str, base_dir: str | None = None) -> str:
+    """Return a path inside an 'Output-Tinified' subfolder with '_tinified' appended.
+
+    base_dir: the folder that contains the *original* source image.  When given,
+    Output-Tinified sits next to the originals rather than next to a processed
+    intermediate (used by the pipeline where *p* is already inside Output/).
+    """
+    pp     = Path(p)
+    folder = (Path(base_dir) if base_dir else pp.parent) / "Output-Tinified"
+    os.makedirs(folder, exist_ok=True)
+    return str(folder / (pp.stem + "_tinified" + pp.suffix))
+
+
+def tinify_file(src: str, dst: str, api_key: str):
+    """Compress *src* with TinyPNG and save the result to *dst*. Returns (ok, error_str)."""
     try:
         import tinify
     except ImportError:
         return False, "'tinify' not installed — run: pip install tinify"
     try:
         tinify.key = api_key
-        tinify.from_file(path).to_file(path)
+        tinify.from_file(src).to_file(dst)
         return True, None
     except tinify.AccountError as e:
         return False, f"TinyPNG account error: {e.message}"
@@ -130,9 +143,15 @@ class ProcessWorker(QThread):
 
         # Optional TinyPNG step inside the pipeline
         if s["tinypng_in_pipeline"] and s["tinypng_key"]:
-            ok, err = tinify_file(dst, s["tinypng_key"])
+            tiny_dst = tinified_path(dst, base_dir=str(Path(src).parent))
+            ok, err  = tinify_file(dst, tiny_dst, s["tinypng_key"])
             if not ok:
                 return False, err
+            # Remove the plain ImageMagick output; keep only the _tinified file
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
 
         return True, None
 
@@ -163,15 +182,17 @@ class TinyWorker(QThread):
             name = Path(path).name
             self.progress.emit(int(i / total * 100), name)
             before_kb = os.path.getsize(path) / 1024
-            ok, err   = tinify_file(path, self.api_key)
+            out_path  = tinified_path(path)
+            ok, err   = tinify_file(path, out_path, self.api_key)
             if ok:
-                after_kb = os.path.getsize(path) / 1024
-                saved    = before_kb - after_kb
-                pct      = saved / before_kb * 100 if before_kb else 0
-                self.log.emit(f"✓  {name}  {before_kb:.1f} KB → {after_kb:.1f} KB  (−{pct:.0f}%)")
+                after_kb  = os.path.getsize(out_path) / 1024
+                saved     = before_kb - after_kb
+                pct       = saved / before_kb * 100 if before_kb else 0
+                out_name  = Path(out_path).name
+                self.log.emit(f"✓  {out_name}  {before_kb:.1f} KB → {after_kb:.1f} KB  (−{pct:.0f}%)")
             else:
                 self.log.emit(f"✗  {name}  —  {err}")
-            results.append((path, ok, err))
+            results.append((out_path if ok else path, ok, err))
         self.progress.emit(100, "Done")
         self.finished.emit(results)
 
@@ -213,10 +234,15 @@ class DropListWidget(QListWidget):
             elif t == QEvent.Type.Drop and isinstance(event, QDropEvent):
                 mime = event.mimeData()
                 if mime is not None and mime.hasUrls():
-                    paths = [
-                        u.toLocalFile() for u in mime.urls()
-                        if u.toLocalFile().lower().endswith(IMAGE_EXTS)
-                    ]
+                    paths = []
+                    for u in mime.urls():
+                        local = u.toLocalFile()
+                        if os.path.isdir(local):
+                            for fname in os.listdir(local):
+                                if fname.lower().endswith(IMAGE_EXTS):
+                                    paths.append(os.path.join(local, fname))
+                        elif local.lower().endswith(IMAGE_EXTS):
+                            paths.append(local)
                     if paths:
                         self.files_dropped.emit(paths)
                     event.acceptProposedAction()
@@ -410,12 +436,9 @@ class SettingsPanel(QWidget):
         self.combo_format = QComboBox()
         self.combo_format.addItems(["PNG32", "PNG", "TGA", "BMP"])
         gl.addWidget(self.combo_format, 0, 1)
-        gl.addWidget(QLabel("Suffix"), 1, 0)
-        self.edit_suffix = QLineEdit("_clean")
-        gl.addWidget(self.edit_suffix, 1, 1)
         self.cb_overwrite = QCheckBox("Overwrite originals")
         self.cb_overwrite.setChecked(False)
-        gl.addWidget(self.cb_overwrite, 2, 0, 1, 2)
+        gl.addWidget(self.cb_overwrite, 1, 0, 1, 2)
         layout.addWidget(out)
 
         layout.addStretch()
@@ -440,7 +463,6 @@ class SettingsPanel(QWidget):
             "tinypng_key":        self.edit_apikey.text().strip(),
             "tinypng_in_pipeline":self.cb_tiny_pipeline.isChecked(),
             "output_format":      self.combo_format.currentText(),
-            "suffix":             self.edit_suffix.text().strip(),
             "overwrite":          self.cb_overwrite.isChecked(),
         }
 
@@ -546,7 +568,6 @@ class MainWindow(QMainWindow):
 
         self._worker     = None   # current background worker
         self._files      = []
-        self._output_dir = None
 
         self._build_ui()
         self._check_magick()
@@ -574,14 +595,9 @@ class MainWindow(QMainWindow):
         btn_add.clicked.connect(self._add_files)
         btn_clear = QPushButton("✕ Clear List")
         btn_clear.clicked.connect(self._clear_files)
-        btn_outdir = QPushButton("📁 Output Folder…")
-        btn_outdir.clicked.connect(self._pick_outdir)
-        self.lbl_outdir = QLabel("Same folder as input")
-        self.lbl_outdir.setStyleSheet("color:#556;font-size:11px;")
         tb1.addWidget(btn_add)
         tb1.addWidget(btn_clear)
-        tb1.addWidget(btn_outdir)
-        tb1.addWidget(self.lbl_outdir, 1)
+        tb1.addStretch(1)
         right.addLayout(tb1)
 
         # ── Toolbar row 2: action buttons ─────────────────────────────────────
@@ -622,7 +638,7 @@ class MainWindow(QMainWindow):
 
         list_w = QWidget()
         ll = QVBoxLayout(list_w); ll.setContentsMargins(0,0,0,0); ll.setSpacing(4)
-        _hint = QLabel("Drag & drop images, or use ＋ Add Images")
+        _hint = QLabel("Drag & drop images or folders, or use ＋ Add Images")
         _hint.setStyleSheet("color:#445;font-size:11px;")
         ll.addWidget(_hint)
         self.file_list = DropListWidget()
@@ -699,12 +715,6 @@ class MainWindow(QMainWindow):
         self.prev_before.clear(); self.prev_after.clear()
         self.log_list.clear(); self.progress.setValue(0)
 
-    def _pick_outdir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select Output Folder")
-        if d:
-            self._output_dir = d
-            self.lbl_outdir.setText(f"→ {d}")
-
     # ── Preview ────────────────────────────────────────────────────────────────
     def _on_selection(self, current, _prev):
         if not current: return
@@ -714,10 +724,14 @@ class MainWindow(QMainWindow):
         self.prev_after.set_image(dst) if os.path.exists(dst) else self.prev_after.clear()
 
     def _make_dst(self, src, s):
-        p      = Path(src)
-        suffix = "" if s["overwrite"] else s["suffix"]
-        ext    = ".tga" if "TGA" in s["output_format"] else ".bmp" if "BMP" in s["output_format"] else ".png"
-        folder = Path(self._output_dir) if self._output_dir else p.parent
+        p   = Path(src)
+        ext = ".tga" if "TGA" in s["output_format"] else ".bmp" if "BMP" in s["output_format"] else ".png"
+        if s["overwrite"]:
+            return str(p.parent / (p.stem + ext))
+        pct    = s["resize_pct"] if s.get("resize") else None
+        suffix = f"_{pct}percent" if pct is not None else "_clean"
+        folder = p.parent / "Output"
+        os.makedirs(folder, exist_ok=True)
         return str(folder / (p.stem + suffix + ext))
 
     # ── Guard: no active worker ────────────────────────────────────────────────
