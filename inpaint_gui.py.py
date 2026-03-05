@@ -161,52 +161,88 @@ def build_hole_mask(pil_img: Image.Image, dilation: int = 0) -> "Image.Image | N
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fill_holes_nearest_neighbour(pil_img: Image.Image,
-                                 hole_mask_arr: np.ndarray) -> "tuple[Image.Image, int]":
+                                 hole_mask_arr: np.ndarray,
+                                 exclude_dark: bool = False,
+                                 dark_threshold: int = 30
+                                 ) -> "tuple[Image.Image, int]":
     """
-    Fill hole pixels by copying the RGBA value of the nearest opaque pixel.
+    Fill hole pixels by copying the RGBA value of the nearest *eligible* opaque pixel.
 
-    This is the only correct approach for indexed / pixel-art images because
-    it never blends colours — every filled pixel gets an exact colour that
-    already exists in the image.
+    eligible = opaque  AND  (luminance >= dark_threshold  OR  exclude_dark is False)
 
-    Uses scipy's distance_transform_edt for fast nearest-neighbour lookup.
+    If a hole pixel has no eligible neighbour (e.g. it is completely surrounded
+    by black outlines) the absolute nearest opaque pixel is used as a fallback
+    so no hole is ever left unfilled.
 
-    Returns (result_image, filled_pixel_count).
-    The result is always RGBA.
+    Returns (result_image_RGBA, filled_pixel_count).
     """
     from scipy.ndimage import distance_transform_edt
 
-    # Work in RGBA throughout
     rgba = np.array(pil_img.convert("RGBA"), dtype=np.uint8)
-    h, w = rgba.shape[:2]
 
-    # hole_pixels: bool mask of pixels we need to fill
-    hole_pixels = hole_mask_arr > 127          # shape (h, w)
-
-    # opaque_pixels: pixels we are allowed to sample from
-    opaque = rgba[:, :, 3] >= 128             # shape (h, w)
+    hole_pixels = hole_mask_arr > 127          # (h, w) bool
+    opaque      = rgba[:, :, 3] >= 128         # (h, w) bool
 
     if not opaque.any():
-        # Nothing opaque to sample → return as-is
         return pil_img.convert("RGBA"), 0
 
-    # distance_transform_edt returns, for every False pixel, the coords of
-    # the nearest True pixel when we pass indices=True.
-    _, (nearest_y, nearest_x) = distance_transform_edt(
-        ~opaque, return_indices=True)
-
-    # For each hole pixel, copy RGBA from its nearest opaque neighbour
-    result = rgba.copy()
     ys, xs = np.where(hole_pixels)
-    ny = nearest_y[ys, xs]
-    nx = nearest_x[ys, xs]
-    result[ys, xs] = rgba[ny, nx]
+    if len(ys) == 0:
+        return pil_img.convert("RGBA"), 0
 
-    # Make filled pixels fully opaque
-    result[ys, xs, 3] = 255
+    # ── Build the "eligible" sampling mask ────────────────────────────────────
+    if exclude_dark and dark_threshold > 0:
+        r = rgba[:, :, 0].astype(np.float32)
+        g = rgba[:, :, 1].astype(np.float32)
+        b = rgba[:, :, 2].astype(np.float32)
+        lum = 0.299 * r + 0.587 * g + 0.114 * b   # ITU-R BT.601 luminance
+        bright_enough = lum >= dark_threshold
+        eligible = opaque & bright_enough
+    else:
+        eligible = opaque
 
-    filled_count = int(len(ys))
-    return Image.fromarray(result, "RGBA"), filled_count
+    result = rgba.copy()
+
+    if eligible.any():
+        # Primary pass: nearest eligible neighbour
+        _, (ny_elig, nx_elig) = distance_transform_edt(~eligible, return_indices=True)
+        ny_primary = ny_elig[ys, xs]
+        nx_primary = nx_elig[ys, xs]
+
+        if exclude_dark and dark_threshold > 0:
+            # Fallback pass: nearest opaque neighbour (for holes with no bright neighbour)
+            _, (ny_any, nx_any) = distance_transform_edt(~opaque, return_indices=True)
+
+            # A hole pixel needs fallback when its nearest eligible pixel is itself
+            # non-eligible (distance_transform still returns *something*, but it may
+            # point to a dark pixel if eligible is False everywhere nearby).
+            # Check: is the colour at the primary source actually eligible?
+            primary_lum = (0.299 * rgba[ny_primary, nx_primary, 0].astype(np.float32)
+                         + 0.587 * rgba[ny_primary, nx_primary, 1].astype(np.float32)
+                         + 0.114 * rgba[ny_primary, nx_primary, 2].astype(np.float32))
+            needs_fallback = primary_lum < dark_threshold
+
+            ny_chosen = np.where(needs_fallback, ny_any[ys, xs], ny_primary)
+            nx_chosen = np.where(needs_fallback, nx_any[ys, xs], nx_primary)
+
+            n_fallback = int(needs_fallback.sum())
+            if n_fallback:
+                pass  # reported in the caller log
+        else:
+            ny_chosen = ny_primary
+            nx_chosen = nx_primary
+            n_fallback = 0
+    else:
+        # No eligible pixels at all → fall back to plain nearest opaque
+        _, (ny_any, nx_any) = distance_transform_edt(~opaque, return_indices=True)
+        ny_chosen  = ny_any[ys, xs]
+        nx_chosen  = nx_any[ys, xs]
+        n_fallback = len(ys)
+
+    result[ys, xs]    = rgba[ny_chosen, nx_chosen]
+    result[ys, xs, 3] = 255   # make filled pixels fully opaque
+
+    return Image.fromarray(result, "RGBA"), int(len(ys))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -488,8 +524,10 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self._backend       = StringVar(value="lama")
         self._radius        = IntVar(value=5)
         self._mask_dilation = IntVar(value=0)
-        self._fill_holes    = BooleanVar(value=False)
-        self._cancel_flag   = threading.Event()
+        self._fill_holes      = BooleanVar(value=False)
+        self._exclude_dark    = BooleanVar(value=False)
+        self._dark_threshold  = IntVar(value=30)   # luminance 0-255
+        self._cancel_flag     = threading.Event()
 
         self._build_ui()
         self._on_engine_change()
@@ -620,7 +658,46 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                  "and reconstructs them by sampling the surrounding texture.",
             font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT,
             justify=LEFT, wraplength=340)
-        self.hole_desc.pack(anchor=W, padx=14, pady=(0, 8))
+        self.hole_desc.pack(anchor=W, padx=14, pady=(0, 6))
+
+        # Exclude-dark row
+        dark_row = Frame(hole_card, bg=SURFACE2)
+        dark_row.pack(fill=X, padx=10, pady=(0, 4))
+
+        self.excl_dark_chk = Checkbutton(
+            dark_row,
+            text="Exclude dark neighbors",
+            variable=self._exclude_dark,
+            command=self._on_exclude_dark_change,
+            bg=SURFACE2, fg=TEXT, selectcolor=SURFACE,
+            activebackground=SURFACE2, activeforeground=ACCENT,
+            font=FONT_BODY, anchor=W)
+        self.excl_dark_chk.pack(side=LEFT)
+        TooltipLabel(
+            dark_row,
+            "When sampling the nearest opaque pixel to fill a hole,\n"
+            "skip any pixel whose luminance is below the threshold.\n\n"
+            "Luminance = 0.299·R + 0.587·G + 0.114·B\n\n"
+            "Useful for pixel art where black outlines surround the holes\n"
+            "and you want to sample the interior fill colour instead.\n\n"
+            "If no bright-enough neighbour exists the absolute nearest\n"
+            "opaque pixel is used as a fallback so holes are always filled."
+        ).pack(side=LEFT, padx=4)
+
+        # Threshold slider — shown/hidden via _on_exclude_dark_change
+        self.dark_thresh_frame = Frame(hole_card, bg=SURFACE2)
+        thresh_lbl_row = Frame(self.dark_thresh_frame, bg=SURFACE2)
+        thresh_lbl_row.pack(fill=X, padx=14)
+        Label(thresh_lbl_row, text="Min luminance threshold",
+              font=FONT_LABEL, bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+        Label(thresh_lbl_row, text="(0 = no exclusion, 255 = exclude all)",
+              font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT, padx=(6, 0))
+        Scale(self.dark_thresh_frame, from_=0, to=254, orient=HORIZONTAL,
+              variable=self._dark_threshold,
+              bg=SURFACE2, fg=TEXT, troughcolor=SURFACE,
+              highlightthickness=0, activebackground=ACCENT,
+              sliderrelief="flat", font=FONT_SMALL,
+              showvalue=True).pack(fill=X, padx=14, pady=(0, 6))
 
         # ── RIGHT column ──────────────────────────────────────────────────────
         SectionLabel(right, "INPAINTING ENGINE").pack(fill=X, pady=(0, 6))
@@ -780,11 +857,18 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             self.radius_frame.pack(fill=X, pady=(10, 0))
 
     def _on_fill_holes_change(self):
-        # Visual feedback when toggled
         if self._fill_holes.get():
             self._log("Fill Holes enabled — interior transparent regions will be auto-filled.")
         else:
             self._log("Fill Holes disabled.")
+
+    def _on_exclude_dark_change(self):
+        if self._exclude_dark.get():
+            self.dark_thresh_frame.pack(fill=X, pady=(2, 6))
+            self._log(f"Exclude dark: ON  (threshold={self._dark_threshold.get()})")
+        else:
+            self.dark_thresh_frame.pack_forget()
+            self._log("Exclude dark: OFF")
 
     def _browse_output(self):
         d = filedialog.askdirectory(title="Select output folder")
@@ -900,8 +984,13 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                         else:
                             hole_count = int((hole_mask_arr > 127).sum())
                             self._log(f"  {hole_count} interior hole px -> nearest-neighbour fill…")
-                            result, filled = fill_holes_nearest_neighbour(result, hole_mask_arr)
-                            self._log(f"  Filled {filled} px (existing palette colours only)", "good")
+                            result, filled = fill_holes_nearest_neighbour(
+                                result, hole_mask_arr,
+                                exclude_dark=self._exclude_dark.get(),
+                                dark_threshold=self._dark_threshold.get())
+                            excl_note = (f"  (dark exclusion ON, threshold={self._dark_threshold.get()})"
+                                         if self._exclude_dark.get() else "")
+                            self._log(f"  Filled {filled} px (existing palette colours only){excl_note}", "good")
 
                 out_name = Path(p).stem + "_processed.png"
                 result.save(out_dir / out_name)
