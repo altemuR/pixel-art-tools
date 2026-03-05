@@ -2,9 +2,10 @@
 Batch Content-Aware Inpainting GUI
 ====================================
 Content-aware fill using OpenCV (built-in, fast) or LaMa AI (optional, high quality).
+Also supports automatic transparent-hole detection and filling.
 
 Requirements — CORE (always needed):
-    pip install Pillow opencv-python tkinterdnd2 numpy
+    pip install Pillow opencv-python tkinterdnd2 numpy scipy
 
 Requirements — AI backend (optional, much better quality):
     pip install simple-lama-inpainting
@@ -62,7 +63,154 @@ FONT_RUN   = ("Courier New", 12, "bold")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INPAINTING BACKENDS
+#  HOLE DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_alpha(pil_img: Image.Image) -> "np.ndarray | None":
+    """
+    Return the alpha channel as a uint8 numpy array, or None if the image
+    has no transparency at all.  Handles RGBA, LA, PA, P+transparency.
+    """
+    mode = pil_img.mode
+    if mode == "RGBA":
+        return np.array(pil_img)[:, :, 3]
+    if mode == "LA":
+        return np.array(pil_img)[:, :, 1]
+    if mode in ("P", "PA"):
+        # Convert palette image to RGBA so we get a real alpha channel
+        rgba = np.array(pil_img.convert("RGBA"))
+        return rgba[:, :, 3]
+    # RGB / L / etc. → no alpha
+    return None
+
+
+def detect_interior_holes(pil_img: Image.Image) -> "np.ndarray | None":
+    """
+    Detect transparent pixels that are *interior* holes (not background).
+
+    Strategy:
+      1. Extract the alpha channel (handles RGBA, LA, P with transparency).
+      2. Build a binary map: 255 = transparent, 0 = opaque.
+      3. Flood-fill with scipy from the four image borders to mark every
+         transparent pixel reachable from outside → those are background.
+      4. Any transparent pixel NOT reached = interior hole.
+
+    Returns uint8 ndarray (255 = hole, 0 = keep), or None if no holes.
+    """
+    alpha = _get_alpha(pil_img)
+    if alpha is None:
+        return None
+
+    h, w = alpha.shape
+    # 255 where transparent (alpha < 128), 0 where opaque
+    trans = (alpha < 128).astype(np.uint8)
+
+    if trans.sum() == 0:
+        return None  # fully opaque
+
+    # --- flood fill exterior using scipy (avoids OpenCV ff_mask sharing bug) ---
+    from scipy.ndimage import label as scipy_label
+
+    # Label connected components of transparent pixels
+    structure = np.ones((3, 3), dtype=np.uint8)  # 8-connectivity
+    labeled, n_labels = scipy_label(trans, structure=structure)
+
+    if n_labels == 0:
+        return None
+
+    # A component is "exterior" if it touches any image border
+    border_labels = set()
+    border_labels.update(labeled[0,   :].tolist())   # top
+    border_labels.update(labeled[h-1, :].tolist())   # bottom
+    border_labels.update(labeled[:,   0].tolist())   # left
+    border_labels.update(labeled[:, w-1].tolist())   # right
+    border_labels.discard(0)  # 0 = opaque pixels, not a component
+
+    # Interior holes = transparent components that never touch the border
+    interior = np.zeros((h, w), dtype=np.uint8)
+    for lbl in range(1, n_labels + 1):
+        if lbl not in border_labels:
+            interior[labeled == lbl] = 255
+
+    if interior.sum() == 0:
+        return None
+
+    return interior
+
+
+def build_hole_mask(pil_img: Image.Image, dilation: int = 0) -> "Image.Image | None":
+    """
+    Return a PIL grayscale mask (white = fill, black = keep) for interior
+    transparent holes, or None if no holes are found.
+    """
+    hole_arr = detect_interior_holes(pil_img)
+    if hole_arr is None:
+        return None
+
+    if dilation > 0 and CV2_AVAILABLE:
+        assert cv2 is not None
+        kernel   = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
+        hole_arr = cv2.dilate(hole_arr, kernel)
+
+    return Image.fromarray(hole_arr)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PIXEL-ART SAFE NEAREST-NEIGHBOUR HOLE FILL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fill_holes_nearest_neighbour(pil_img: Image.Image,
+                                 hole_mask_arr: np.ndarray) -> "tuple[Image.Image, int]":
+    """
+    Fill hole pixels by copying the RGBA value of the nearest opaque pixel.
+
+    This is the only correct approach for indexed / pixel-art images because
+    it never blends colours — every filled pixel gets an exact colour that
+    already exists in the image.
+
+    Uses scipy's distance_transform_edt for fast nearest-neighbour lookup.
+
+    Returns (result_image, filled_pixel_count).
+    The result is always RGBA.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    # Work in RGBA throughout
+    rgba = np.array(pil_img.convert("RGBA"), dtype=np.uint8)
+    h, w = rgba.shape[:2]
+
+    # hole_pixels: bool mask of pixels we need to fill
+    hole_pixels = hole_mask_arr > 127          # shape (h, w)
+
+    # opaque_pixels: pixels we are allowed to sample from
+    opaque = rgba[:, :, 3] >= 128             # shape (h, w)
+
+    if not opaque.any():
+        # Nothing opaque to sample → return as-is
+        return pil_img.convert("RGBA"), 0
+
+    # distance_transform_edt returns, for every False pixel, the coords of
+    # the nearest True pixel when we pass indices=True.
+    _, (nearest_y, nearest_x) = distance_transform_edt(
+        ~opaque, return_indices=True)
+
+    # For each hole pixel, copy RGBA from its nearest opaque neighbour
+    result = rgba.copy()
+    ys, xs = np.where(hole_pixels)
+    ny = nearest_y[ys, xs]
+    nx = nearest_x[ys, xs]
+    result[ys, xs] = rgba[ny, nx]
+
+    # Make filled pixels fully opaque
+    result[ys, xs, 3] = 255
+
+    filled_count = int(len(ys))
+    return Image.fromarray(result, "RGBA"), filled_count
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INPAINTING BACKENDS  (mask-based, for when a user mask is supplied)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def inpaint_opencv(pil_img: Image.Image, pil_mask: Image.Image,
@@ -79,8 +227,8 @@ def inpaint_opencv(pil_img: Image.Image, pil_mask: Image.Image,
 
     has_alpha = pil_img.mode == "RGBA"
     rgba_arr  = np.array(pil_img.convert("RGBA"))
-    src_bgr   = cv2.cvtColor(rgba_arr[:, :, :3], cv2.COLOR_RGB2BGR)
     alpha_ch  = rgba_arr[:, :, 3]
+    src_bgr   = cv2.cvtColor(rgba_arr[:, :, :3], cv2.COLOR_RGB2BGR)
 
     mask_np = np.array(pil_mask.convert("L"))
     if mask_np.shape[:2] != src_bgr.shape[:2]:
@@ -89,6 +237,20 @@ def inpaint_opencv(pil_img: Image.Image, pil_mask: Image.Image,
                              interpolation=cv2.INTER_NEAREST)
     _, mask_bin = cv2.threshold(mask_np, 127, 255, cv2.THRESH_BINARY)
 
+    # Pre-fill transparent pixels with nearest opaque neighbour so OpenCV
+    # has valid RGB data to sample at the boundary.
+    if has_alpha:
+        trans = alpha_ch < 128
+        if trans.any():
+            from scipy.ndimage import distance_transform_edt
+            opaque = ~trans
+            _, (ny, nx) = distance_transform_edt(trans, return_indices=True)
+            # Vectorised nearest-neighbour copy
+            ys, xs = np.where(trans)
+            src_bgr_filled = src_bgr.copy()
+            src_bgr_filled[ys, xs] = src_bgr[ny[ys, xs], nx[ys, xs]]
+            src_bgr = src_bgr_filled
+
     flag = cv2.INPAINT_TELEA if method == "telea" else cv2.INPAINT_NS
     result_bgr = cv2.inpaint(src_bgr, mask_bin, inpaintRadius=radius, flags=flag)
     result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
@@ -96,7 +258,10 @@ def inpaint_opencv(pil_img: Image.Image, pil_mask: Image.Image,
 
     if has_alpha:
         result_pil = result_pil.convert("RGBA")
-        result_pil.putalpha(Image.fromarray(alpha_ch))
+        new_alpha = alpha_ch.copy()
+        hole_px   = mask_bin > 127
+        new_alpha[hole_px] = 255
+        result_pil.putalpha(Image.fromarray(new_alpha))
 
     return result_pil
 
@@ -124,7 +289,12 @@ def inpaint_lama(pil_img: Image.Image, pil_mask: Image.Image) -> Image.Image:
 
     if pil_img.mode == "RGBA":
         result = result.convert("RGBA")
-        result.putalpha(pil_img.split()[3])
+        orig_alpha = np.array(pil_img.split()[3])
+        new_alpha  = orig_alpha.copy()
+        hole_px    = np.array(gray_mask) > 127
+        if hole_px.shape == new_alpha.shape:
+            new_alpha[hole_px] = 255
+        result.putalpha(Image.fromarray(new_alpha))
 
     return result
 
@@ -304,8 +474,8 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         super().__init__()
         self.title("Batch Content-Aware Inpainter")
         self.configure(bg=BG)
-        self.geometry("920x840")
-        self.minsize(800, 700)
+        self.geometry("920x900")
+        self.minsize(800, 750)
 
         s = ttk.Style(self)
         s.theme_use("clam")
@@ -318,6 +488,7 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self._backend       = StringVar(value="lama")
         self._radius        = IntVar(value=5)
         self._mask_dilation = IntVar(value=0)
+        self._fill_holes    = BooleanVar(value=False)
         self._cancel_flag   = threading.Event()
 
         self._build_ui()
@@ -329,7 +500,13 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         if not CV2_AVAILABLE:
             self._log("⚠  opencv-python not found → pip install opencv-python", "warn")
         else:
-            self._log("✓  OpenCV ready  (Telea & Navier-Stokes available)", "good")
+            self._log("✓  OpenCV ready  (Telea & Navier-Stokes + hole detection)", "good")
+
+        try:
+            import scipy  # noqa
+            self._log("✓  scipy ready  (hole detection + nearest-neighbour fill)", "good")
+        except ImportError:
+            self._log("⚠  scipy not found → pip install scipy  (required for Fill Holes)", "warn")
 
         if not DND_AVAILABLE:
             self._log("ℹ  Drag-and-drop disabled → pip install tkinterdnd2", "warn")
@@ -349,7 +526,7 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
               bg=BG, fg=ACCENT).pack(anchor=W)
         Label(hdr, text="Batch Inpainter", font=FONT_HEAD, bg=BG, fg=TEXT).pack(anchor=W)
         Label(hdr,
-              text="mask-driven fill  ·  OpenCV Telea / Navier-Stokes  ·  LaMa AI",
+              text="mask-driven fill  ·  OpenCV Telea / Navier-Stokes  ·  LaMa AI  ·  hole fill",
               font=FONT_SMALL, bg=BG, fg=SUBTEXT).pack(anchor=W)
         Frame(self, bg=BORDER, height=1).pack(fill=X, padx=28, pady=(10, 0))
 
@@ -384,12 +561,20 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self.thumb = ThumbnailStrip(left, height=86)
         self.thumb.pack(fill=X, pady=(6, 12))
 
-        SectionLabel(left, "MASK IMAGE").pack(fill=X, pady=(0, 4))
+        SectionLabel(left, "MASK IMAGE  (optional)").pack(fill=X, pady=(0, 4))
         Label(left, text="White = fill region     Black = keep region",
+              font=FONT_SMALL, bg=BG, fg=SUBTEXT).pack(anchor=W, pady=(0, 2))
+        Label(left, text="Leave empty to use Fill Holes mode only.",
               font=FONT_SMALL, bg=BG, fg=SUBTEXT).pack(anchor=W, pady=(0, 4))
         self.mask_drop = DropZone(left, "Drop mask here",
-                                  multi=False, on_file=self._on_mask, height=100)
+                                  multi=False, on_file=self._on_mask, height=90)
         self.mask_drop.pack(fill=X)
+
+        # Mask clear button
+        mask_btn_row = Frame(left, bg=BG)
+        mask_btn_row.pack(fill=X, pady=(4, 0))
+        styled_btn(mask_btn_row, "Clear mask",
+                   self._clear_mask, small=True).pack(side=LEFT)
 
         mask_preview_row = Frame(left, bg=BG)
         mask_preview_row.pack(fill=X, pady=(6, 0))
@@ -398,6 +583,44 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self.mask_info_lbl  = Label(mask_preview_row, text="", font=FONT_SMALL,
                                     bg=BG, fg=SUBTEXT, justify=LEFT)
         self.mask_info_lbl.pack(side=LEFT, padx=10)
+
+        # ── Fill Holes panel ─────────────────────────────────────────────────
+        SectionLabel(left, "HOLE FILLING").pack(fill=X, pady=(14, 4))
+
+        hole_card = Frame(left, bg=SURFACE2,
+                          highlightthickness=1, highlightbackground=BORDER)
+        hole_card.pack(fill=X)
+
+        hole_top = Frame(hole_card, bg=SURFACE2)
+        hole_top.pack(fill=X, padx=10, pady=(8, 4))
+
+        self.fill_holes_chk = Checkbutton(
+            hole_top,
+            text="Fill Holes  —  auto-detect & fill transparent interior regions",
+            variable=self._fill_holes,
+            command=self._on_fill_holes_change,
+            bg=SURFACE2, fg=TEXT, selectcolor=SURFACE,
+            activebackground=SURFACE2, activeforeground=ACCENT,
+            font=FONT_BODY, anchor=W)
+        self.fill_holes_chk.pack(side=LEFT, fill=X, expand=True)
+        TooltipLabel(
+            hole_top,
+            "Scans each image for transparent 'holes' that are completely\n"
+            "surrounded by opaque pixels (i.e. interior gaps, not the\n"
+            "image background) and fills them using content-aware sampling\n"
+            "of the surrounding pixels.\n\n"
+            "Works on RGBA/PNG images with an alpha channel.\n"
+            "Can be combined with a mask, or used alone without a mask.\n\n"
+            "Tip: Use PNG sources — JPEG has no transparency."
+        ).pack(side=RIGHT, padx=6)
+
+        self.hole_desc = Label(
+            hole_card,
+            text="Finds pixels enclosed inside a shape (alpha = 0 inside opaque edges)\n"
+                 "and reconstructs them by sampling the surrounding texture.",
+            font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT,
+            justify=LEFT, wraplength=340)
+        self.hole_desc.pack(anchor=W, padx=14, pady=(0, 8))
 
         # ── RIGHT column ──────────────────────────────────────────────────────
         SectionLabel(right, "INPAINTING ENGINE").pack(fill=X, pady=(0, 6))
@@ -474,7 +697,7 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         # Run / Cancel
         btn_row = Frame(right, bg=BG)
         btn_row.pack(fill=X, pady=(16, 4))
-        self.run_btn = Button(btn_row, text="▶  RUN  INPAINTING",
+        self.run_btn = Button(btn_row, text="▶  PROCESS  IMAGE(S)",
                               command=self._run,
                               bg=ACCENT, fg="#ffffff", relief="flat",
                               disabledforeground="#ffffff",
@@ -518,7 +741,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self.thumb.set_images(paths)
         self.img_count_lbl.configure(text=f"{len(paths)} image(s)")
         self._log(f"Loaded {len(paths)} source image(s).")
-        # Auto-set output to a subfolder of the first image's directory
         auto_out = str(Path(paths[0]).parent / "Output")
         self._output_dir.set(auto_out)
 
@@ -543,12 +765,26 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             self.mask_info_lbl.configure(text=str(e))
         self._log(f"Mask loaded: {Path(path).name}")
 
+    def _clear_mask(self):
+        self._mask_path = None
+        self.mask_drop.clear()
+        self.mask_thumb_lbl.configure(image="")
+        self.mask_thumb_lbl.image = None  # type: ignore[attr-defined]
+        self.mask_info_lbl.configure(text="")
+        self._log("Mask cleared.")
+
     def _on_engine_change(self):
         if self._backend.get() == "lama":
             self.radius_frame.pack_forget()
         else:
-            # re-show after the engine radio section
             self.radius_frame.pack(fill=X, pady=(10, 0))
+
+    def _on_fill_holes_change(self):
+        # Visual feedback when toggled
+        if self._fill_holes.get():
+            self._log("Fill Holes enabled — interior transparent regions will be auto-filled.")
+        else:
+            self._log("Fill Holes disabled.")
 
     def _browse_output(self):
         d = filedialog.askdirectory(title="Select output folder")
@@ -560,13 +796,25 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         if not self._image_paths:
             messagebox.showwarning("No images", "Please load source images first.")
             return
-        if not self._mask_path:
-            messagebox.showwarning("No mask", "Please load a mask image.")
+
+        has_mask       = bool(self._mask_path)
+        fill_holes_on  = self._fill_holes.get()
+
+        if not has_mask and not fill_holes_on:
+            messagebox.showwarning(
+                "Nothing to do",
+                "Please either load a mask image or enable 'Fill Holes'.")
             return
+
         backend = self._backend.get()
         if not CV2_AVAILABLE and backend != "lama":
             messagebox.showerror("Missing dependency",
                                  "opencv-python is required for this engine.\n"
+                                 "Run:  pip install opencv-python")
+            return
+        if not CV2_AVAILABLE and fill_holes_on:
+            messagebox.showerror("Missing dependency",
+                                 "opencv-python is required for hole detection.\n"
                                  "Run:  pip install opencv-python")
             return
 
@@ -584,28 +832,32 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
 
     # ── Processing thread ─────────────────────────────────────────────────────
     def _process_thread(self):
-        out_dir  = Path(self._output_dir.get())
+        out_dir   = Path(self._output_dir.get())
         out_dir.mkdir(parents=True, exist_ok=True)
-        backend  = self._backend.get()
-        radius   = self._radius.get()
-        dilation = self._mask_dilation.get()
+        backend   = self._backend.get()
+        radius    = self._radius.get()
+        dilation  = self._mask_dilation.get()
+        has_mask  = bool(self._mask_path)
+        fill_holes_on = self._fill_holes.get()
 
-        # Load and optionally dilate the mask once
-        assert self._mask_path is not None
-        try:
-            mask_pil = Image.open(self._mask_path).convert("L")
-            if dilation > 0 and CV2_AVAILABLE:
-                assert cv2 is not None
-                mask_np  = np.array(mask_pil)
-                kernel   = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
-                mask_np  = cv2.dilate(mask_np, kernel)
-                mask_pil = Image.fromarray(mask_np)
-                self._log(f"Mask dilated by {dilation}px")
-        except Exception as e:
-            self._log(f"Failed to load mask: {e}", "err")
-            self.after(0, self._done)
-            return
+        # Load and optionally dilate the user-supplied mask once
+        mask_pil: "Image.Image | None" = None
+        if has_mask:
+            assert self._mask_path is not None
+            try:
+                mask_pil = Image.open(self._mask_path).convert("L")
+                if dilation > 0 and CV2_AVAILABLE:
+                    assert cv2 is not None
+                    mask_np  = np.array(mask_pil)
+                    kernel   = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1))
+                    mask_np  = cv2.dilate(mask_np, kernel)
+                    mask_pil = Image.fromarray(mask_np)
+                    self._log(f"Mask dilated by {dilation}px")
+            except Exception as e:
+                self._log(f"Failed to load mask: {e}", "err")
+                self.after(0, self._done)
+                return
 
         success = fail = 0
         for i, p in enumerate(self._image_paths):
@@ -614,20 +866,44 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                 break
             try:
                 src = Image.open(p)
-                m   = mask_pil
-                if m.size != src.size:
-                    m = m.resize(src.size, Image.Resampling.NEAREST)
 
                 self.after(0, self.status_lbl.configure,
                            {"text": f"[{i+1}/{len(self._image_paths)}] {Path(p).name}…",
                             "fg": ACCENT})
 
-                if backend in ("telea", "ns"):
-                    result = inpaint_opencv(src, m, method=backend, radius=radius)
-                else:
-                    result = inpaint_lama(src, m)
+                result = src.copy()
 
-                out_name = Path(p).stem + "_inpainted.png"
+                # ── Step 1: apply user mask inpainting (if mask loaded) ──
+                if mask_pil is not None:
+                    m = mask_pil
+                    if m.size != src.size:
+                        m = m.resize(src.size, Image.Resampling.NEAREST)
+                    if backend in ("telea", "ns"):
+                        result = inpaint_opencv(result, m, method=backend, radius=radius)
+                    else:
+                        result = inpaint_lama(result, m)
+                    self._log(f"  Mask inpainting done: {Path(p).name}")
+
+                # ── Step 2: fill interior transparent holes ──────────────
+                if fill_holes_on:
+                    # Diagnose image mode first
+                    self._log(f"  mode:{result.mode} size:{result.size[0]}x{result.size[1]}")
+                    alpha_dbg = _get_alpha(result)
+                    if alpha_dbg is None:
+                        self._log("  No alpha channel — hole fill skipped (need RGBA/PNG)", "warn")
+                    else:
+                        total_trans = int((alpha_dbg < 128).sum())
+                        self._log(f"  {total_trans} transparent px detected in alpha channel")
+                        hole_mask_arr = detect_interior_holes(result)
+                        if hole_mask_arr is None:
+                            self._log("  No interior holes — all transparent px touch the border")
+                        else:
+                            hole_count = int((hole_mask_arr > 127).sum())
+                            self._log(f"  {hole_count} interior hole px -> nearest-neighbour fill…")
+                            result, filled = fill_holes_nearest_neighbour(result, hole_mask_arr)
+                            self._log(f"  Filled {filled} px (existing palette colours only)", "good")
+
+                out_name = Path(p).stem + "_processed.png"
                 result.save(out_dir / out_name)
                 self._log(f"✓  {Path(p).name}", "good")
                 success += 1
@@ -649,7 +925,7 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self.progress["value"] = val
 
     def _done(self, colour=SUCCESS):
-        self.run_btn.configure(state=NORMAL, text="▶  RUN  INPAINTING")
+        self.run_btn.configure(state=NORMAL, text="▶  PROCESS  IMAGE(S)")
         self.cancel_btn.configure(state=DISABLED)
         self.status_lbl.configure(text="Done!", fg=colour)
 
