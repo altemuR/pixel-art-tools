@@ -335,9 +335,110 @@ def inpaint_lama(pil_img: Image.Image, pil_mask: Image.Image) -> Image.Image:
     return result
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  WIDGETS
+#  OUTER EDGE TRIMMING
 # ══════════════════════════════════════════════════════════════════════════════
+
+def trim_outer_edge(pil_img: Image.Image,
+                    min_length_pct: float = 5.0,
+                    straightness_threshold: float = 0.92,
+                    trim_px: int = 1,
+                    ) -> "tuple[Image.Image, int, int]":
+    """
+    Remove the outermost layer of opaque pixels that form long, jagged edges.
+
+    These are the pixels that sit right at the boundary between opaque content
+    and transparency — the outer edge ring.  Setting them transparent effectively
+    trims a 1-pixel fringe of jaggies without touching any interior pixels.
+
+    Only opaque pixels that directly border the transparent background are ever
+    modified.  Interior pixels (surrounded by other opaque pixels on all sides)
+    are guaranteed to be untouched.
+
+    Parameters
+    ----------
+    min_length_pct        : minimum contour arc-length as % of image diagonal.
+                            Short contours (dots, tiny artifacts) are skipped.
+    straightness_threshold: arc/chord score cutoff.  Contours already close to
+                            a straight line (score >= threshold) are left alone.
+                            Lower = only trim very jagged edges.
+                            Higher = also trim mildly jagged edges.
+    trim_px               : how many outer-edge pixel layers to remove (1–3).
+
+    Returns
+    -------
+    (result_image_RGBA, contours_trimmed, pixels_removed)
+    """
+    if not CV2_AVAILABLE:
+        raise RuntimeError("opencv-python is required for edge trimming.\n"
+                           "Run: pip install opencv-python")
+    assert cv2 is not None
+
+    rgba  = np.array(pil_img.convert("RGBA"), dtype=np.uint8)
+    h, w  = rgba.shape[:2]
+    alpha = rgba[:, :, 3]
+
+    # ── 1. Outer-edge mask: opaque pixels that touch ≥1 transparent px ───────
+    opaque_mask = (alpha >= 128).astype(np.uint8) * 255
+    trans_mask  = (alpha  < 128).astype(np.uint8) * 255
+    kernel_3    = np.ones((3, 3), np.uint8)
+    trans_dilat = cv2.dilate(trans_mask, kernel_3, iterations=1)
+    edge_mask   = cv2.bitwise_and(opaque_mask, trans_dilat)   # 0/255
+
+    if edge_mask.max() == 0:
+        return pil_img.convert("RGBA"), 0, 0
+
+    # ── 2. Find contours on the edge mask (every pixel) ──────────────────────
+    contours, _ = cv2.findContours(edge_mask, cv2.RETR_LIST,
+                                   cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return pil_img.convert("RGBA"), 0, 0
+
+    # ── 3. Filter: keep long + sufficiently jagged contours ──────────────────
+    diagonal    = (h ** 2 + w ** 2) ** 0.5
+    min_arc_len = diagonal * (min_length_pct / 100.0)
+
+    kept = []
+    for cnt in contours:
+        arc = cv2.arcLength(cnt, closed=False)
+        if arc < min_arc_len:
+            continue
+        pts = cnt[:, 0, :]
+        if len(pts) < 4:
+            continue
+        start = pts[0].astype(float)
+        end   = pts[-1].astype(float)
+        chord = max(float(np.linalg.norm(end - start)), 1.0)
+        ratio = arc / chord                        # 1.0 = straight, >1 = jagged
+        straightness_score = 1.0 / max(ratio, 1.0)
+        if straightness_score >= straightness_threshold:
+            continue   # already straight — leave it alone
+        kept.append(cnt)
+
+    if not kept:
+        return pil_img.convert("RGBA"), 0, 0
+
+    # ── 4. Build a trim mask covering only the kept contour pixels ────────────
+    trim_mask = np.zeros((h, w), dtype=np.uint8)
+    for cnt in kept:
+        cv2.drawContours(trim_mask, [cnt], -1, 255, thickness=trim_px)
+
+    # Safety: only erase pixels that are genuinely on the outer edge.
+    # AND with the full edge_mask so we can never touch interior pixels.
+    trim_mask = cv2.bitwise_and(trim_mask, edge_mask)
+
+    # ── 5. Set those pixels to fully transparent ──────────────────────────────
+    result = rgba.copy()
+    ey, ex = np.where(trim_mask > 0)
+    result[ey, ex, 3] = 0          # alpha → 0 (transparent)
+    # Clear RGB too so no fringe shows up under semi-transparent compositing
+    result[ey, ex, :3] = 0
+
+    return Image.fromarray(result, "RGBA"), len(kept), int(len(ey))
+
+
+
 
 def styled_btn(parent, text, command, primary=False, small=False):
     bg  = ACCENT  if primary else SURFACE2
@@ -527,7 +628,12 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self._fill_holes      = BooleanVar(value=False)
         self._exclude_dark    = BooleanVar(value=False)
         self._dark_threshold  = IntVar(value=30)   # luminance 0-255
-        self._cancel_flag     = threading.Event()
+        # trim outer edge
+        self._smooth_outlines          = BooleanVar(value=False)
+        self._outline_min_len          = DoubleVar(value=5.0)   # % of diagonal
+        self._outline_straightness_pct = IntVar(value=90)       # slider 50–99
+        self._outline_trim_px          = IntVar(value=1)        # layers to remove
+        self._cancel_flag              = threading.Event()
 
         self._build_ui()
         self._on_engine_change()
@@ -698,6 +804,97 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
               highlightthickness=0, activebackground=ACCENT,
               sliderrelief="flat", font=FONT_SMALL,
               showvalue=True).pack(fill=X, padx=14, pady=(0, 6))
+
+        # ── Trim Outer Edge panel ─────────────────────────────────────────────
+        SectionLabel(left, "TRIM OUTER EDGE").pack(fill=X, pady=(14, 4))
+
+        outline_card = Frame(left, bg=SURFACE2,
+                             highlightthickness=1, highlightbackground=BORDER)
+        outline_card.pack(fill=X)
+
+        # Enable checkbox
+        outline_top = Frame(outline_card, bg=SURFACE2)
+        outline_top.pack(fill=X, padx=10, pady=(8, 4))
+        Checkbutton(
+            outline_top,
+            text="Trim Outer Edge  —  remove jagged outer-edge pixels",
+            variable=self._smooth_outlines,
+            command=self._on_smooth_outlines_change,
+            bg=SURFACE2, fg=TEXT, selectcolor=SURFACE,
+            activebackground=SURFACE2, activeforeground=ACCENT,
+            font=FONT_BODY, anchor=W).pack(side=LEFT, fill=X, expand=True)
+        TooltipLabel(
+            outline_top,
+            "Finds opaque pixels that sit right on the outer boundary\n"
+            "(touching transparent background) and removes them by\n"
+            "setting their alpha to 0.\n\n"
+            "Only the outermost pixel ring is ever affected — interior\n"
+            "pixels surrounded by other opaque pixels are guaranteed\n"
+            "to be untouched.\n\n"
+            "Short or already-straight edges are skipped. Use the\n"
+            "sliders below to control which edges are trimmed."
+        ).pack(side=RIGHT, padx=6)
+
+        # Sub-controls frame (shown/hidden)
+        self.outline_controls = Frame(outline_card, bg=SURFACE2)
+
+        # Min length
+        len_row = Frame(self.outline_controls, bg=SURFACE2)
+        len_row.pack(fill=X, padx=10, pady=(4, 0))
+        lh = Frame(len_row, bg=SURFACE2)
+        lh.pack(fill=X)
+        Label(lh, text="MIN EDGE LENGTH", font=FONT_LABEL,
+              bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+        TooltipLabel(lh,
+            "Minimum length of an edge segment to be trimmed,\n"
+            "as % of the image diagonal.\n\n"
+            "Tiny edges (dots, small artifacts) are below this\n"
+            "and are left untouched.\n"
+            "Increase to ignore more small details."
+        ).pack(side=LEFT, padx=4)
+        Scale(len_row, from_=1, to=30, resolution=1, orient=HORIZONTAL,
+              variable=self._outline_min_len,
+              bg=SURFACE2, fg=TEXT, troughcolor=SURFACE,
+              highlightthickness=0, activebackground=ACCENT,
+              sliderrelief="flat", font=FONT_SMALL,
+              showvalue=True).pack(fill=X)
+
+        # Straightness filter
+        str_row = Frame(self.outline_controls, bg=SURFACE2)
+        str_row.pack(fill=X, padx=10, pady=(4, 0))
+        sh = Frame(str_row, bg=SURFACE2)
+        sh.pack(fill=X)
+        Label(sh, text="JAGGEDNESS THRESHOLD", font=FONT_LABEL,
+              bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+        TooltipLabel(sh,
+            "Controls how jagged an edge must be before it gets trimmed.\n\n"
+            "Measured as: arc_length / endpoint_distance\n"
+            "  1.0 = perfectly straight line → skipped\n"
+            "  >1  = jagged → trimmed\n\n"
+            "Higher value = trim more edges (including mild jags).\n"
+            "Lower value  = only trim very jagged edges.\n\n"
+            "Recommended: 85–95 for pixel art."
+        ).pack(side=LEFT, padx=4)
+        Scale(str_row, from_=50, to=99, resolution=1, orient=HORIZONTAL,
+              variable=self._outline_straightness_pct,
+              bg=SURFACE2, fg=TEXT, troughcolor=SURFACE,
+              highlightthickness=0, activebackground=ACCENT,
+              sliderrelief="flat", font=FONT_SMALL,
+              showvalue=True).pack(fill=X)
+        Label(str_row, text="(×100 — e.g. 90 = skip edges with score ≥ 0.90)",
+              font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(anchor=W)
+
+        # Trim depth
+        trim_row = Frame(self.outline_controls, bg=SURFACE2)
+        trim_row.pack(fill=X, padx=10, pady=(6, 8))
+        Label(trim_row, text="Trim depth", font=FONT_SMALL,
+              bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+        Spinbox(trim_row, from_=1, to=3, textvariable=self._outline_trim_px,
+                width=3, bg=SURFACE, fg=TEXT,
+                buttonbackground=SURFACE2, relief="flat",
+                font=FONT_BODY, insertbackground=TEXT).pack(side=LEFT, padx=6)
+        Label(trim_row, text="px  (outer layers to remove)",
+              font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
 
         # ── RIGHT column ──────────────────────────────────────────────────────
         SectionLabel(right, "INPAINTING ENGINE").pack(fill=X, pady=(0, 6))
@@ -870,6 +1067,14 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             self.dark_thresh_frame.pack_forget()
             self._log("Exclude dark: OFF")
 
+    def _on_smooth_outlines_change(self):
+        if self._smooth_outlines.get():
+            self.outline_controls.pack(fill=X)
+            self._log("Trim Outer Edge enabled.")
+        else:
+            self.outline_controls.pack_forget()
+            self._log("Trim Outer Edge disabled.")
+
     def _browse_output(self):
         d = filedialog.askdirectory(title="Select output folder")
         if d:
@@ -881,13 +1086,14 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             messagebox.showwarning("No images", "Please load source images first.")
             return
 
-        has_mask       = bool(self._mask_path)
-        fill_holes_on  = self._fill_holes.get()
+        has_mask           = bool(self._mask_path)
+        fill_holes_on      = self._fill_holes.get()
+        smooth_outlines_on = self._smooth_outlines.get()
 
-        if not has_mask and not fill_holes_on:
+        if not has_mask and not fill_holes_on and not smooth_outlines_on:
             messagebox.showwarning(
                 "Nothing to do",
-                "Please either load a mask image or enable 'Fill Holes'.")
+                "Please either load a mask, enable 'Fill Holes', or enable 'Trim Outer Edge'.")
             return
 
         backend = self._backend.get()
@@ -918,11 +1124,15 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
     def _process_thread(self):
         out_dir   = Path(self._output_dir.get())
         out_dir.mkdir(parents=True, exist_ok=True)
-        backend   = self._backend.get()
-        radius    = self._radius.get()
-        dilation  = self._mask_dilation.get()
-        has_mask  = bool(self._mask_path)
-        fill_holes_on = self._fill_holes.get()
+        backend            = self._backend.get()
+        radius             = self._radius.get()
+        dilation           = self._mask_dilation.get()
+        has_mask           = bool(self._mask_path)
+        fill_holes_on      = self._fill_holes.get()
+        smooth_outlines_on   = self._smooth_outlines.get()
+        outline_min_len      = float(self._outline_min_len.get())
+        outline_straightness = self._outline_straightness_pct.get() / 100.0
+        outline_trim_px      = self._outline_trim_px.get()
 
         # Load and optionally dilate the user-supplied mask once
         mask_pil: "Image.Image | None" = None
@@ -991,6 +1201,21 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                             excl_note = (f"  (dark exclusion ON, threshold={self._dark_threshold.get()})"
                                          if self._exclude_dark.get() else "")
                             self._log(f"  Filled {filled} px (existing palette colours only){excl_note}", "good")
+
+                # ── Step 3: trim outer edge ──────────────────────────────
+                if smooth_outlines_on:
+                    self._log(f"  Trim outer edge (min={outline_min_len:.1f}% diag, "
+                              f"jaggedness<{outline_straightness:.2f}, "
+                              f"depth={outline_trim_px}px)…")
+                    result, n_edges, n_px = trim_outer_edge(
+                        result,
+                        min_length_pct=outline_min_len,
+                        straightness_threshold=outline_straightness,
+                        trim_px=outline_trim_px)
+                    if n_edges == 0:
+                        self._log("  No qualifying jagged edges found — try raising the jaggedness threshold or lowering min length", "warn")
+                    else:
+                        self._log(f"  Trimmed {n_edges} edge segment(s), {n_px} px removed", "good")
 
                 out_name = Path(p).stem + "_processed.png"
                 result.save(out_dir / out_name)
