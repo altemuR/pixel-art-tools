@@ -63,6 +63,59 @@ FONT_RUN   = ("Courier New", 12, "bold")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  INDEXED IMAGE NORMALISATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def normalise_image(pil_img: Image.Image) -> Image.Image:
+    """
+    Convert any image mode that downstream processing cannot handle directly
+    into a consistent RGBA or RGB image.
+
+    Handled cases
+    -------------
+    P  / PA   Palette (indexed) images.
+              Transparency may be stored as a palette-index in img.info
+              rather than a real alpha channel.  We convert to RGBA when any
+              transparency is present so that hole-detection, edge-trimming,
+              and inpainting all see a proper alpha channel; otherwise to RGB.
+
+    LA        Greyscale + alpha → RGBA (preserves transparency).
+
+    1         1-bit bilevel → RGB (no meaningful alpha concept).
+
+    RGBA / RGB / L   Returned unchanged — already in a supported format.
+
+    Any other mode   Converted to RGBA as a safe fallback.
+    """
+    mode = pil_img.mode
+
+    if mode in ("RGB", "RGBA", "L"):
+        return pil_img  # already fine
+
+    if mode in ("P", "PA"):
+        # Pillow stores palette-transparency in img.info["transparency"] as
+        # either a single int (the transparent palette index) or a bytes
+        # object with one alpha value per palette slot.
+        has_transparency = (
+            "transparency" in pil_img.info
+            or mode == "PA"
+        )
+        return pil_img.convert("RGBA" if has_transparency else "RGB")
+
+    if mode == "LA":
+        return pil_img.convert("RGBA")
+
+    if mode == "1":
+        return pil_img.convert("RGB")
+
+    # Catch-all: CMYK, YCbCr, HSV, I, F, etc.
+    try:
+        return pil_img.convert("RGBA")
+    except Exception:
+        return pil_img.convert("RGB")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  HOLE DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -213,10 +266,6 @@ def fill_holes_nearest_neighbour(pil_img: Image.Image,
             # Fallback pass: nearest opaque neighbour (for holes with no bright neighbour)
             _, (ny_any, nx_any) = distance_transform_edt(~opaque, return_indices=True)
 
-            # A hole pixel needs fallback when its nearest eligible pixel is itself
-            # non-eligible (distance_transform still returns *something*, but it may
-            # point to a dark pixel if eligible is False everywhere nearby).
-            # Check: is the colour at the primary source actually eligible?
             primary_lum = (0.299 * rgba[ny_primary, nx_primary, 0].astype(np.float32)
                          + 0.587 * rgba[ny_primary, nx_primary, 1].astype(np.float32)
                          + 0.114 * rgba[ny_primary, nx_primary, 2].astype(np.float32))
@@ -255,11 +304,17 @@ def inpaint_opencv(pil_img: Image.Image, pil_mask: Image.Image,
     Content-aware inpainting using OpenCV.
     method : 'telea' or 'ns'
     mask   : white = fill region, black = keep region
+
+    Accepts any image mode — indexed/palette images are normalised to
+    RGBA or RGB before processing so palette-transparency is preserved.
     """
     if not CV2_AVAILABLE:
         raise RuntimeError(
             "opencv-python is not installed.\nRun: pip install opencv-python")
     assert cv2 is not None
+
+    # Normalise mode: palette/indexed → RGBA or RGB before anything else
+    pil_img  = normalise_image(pil_img)
 
     has_alpha = pil_img.mode == "RGBA"
     rgba_arr  = np.array(pil_img.convert("RGBA"))
@@ -279,9 +334,7 @@ def inpaint_opencv(pil_img: Image.Image, pil_mask: Image.Image,
         trans = alpha_ch < 128
         if trans.any():
             from scipy.ndimage import distance_transform_edt
-            opaque = ~trans
             _, (ny, nx) = distance_transform_edt(trans, return_indices=True)
-            # Vectorised nearest-neighbour copy
             ys, xs = np.where(trans)
             src_bgr_filled = src_bgr.copy()
             src_bgr_filled[ys, xs] = src_bgr[ny[ys, xs], nx[ys, xs]]
@@ -306,6 +359,9 @@ def inpaint_lama(pil_img: Image.Image, pil_mask: Image.Image) -> Image.Image:
     """
     Content-aware inpainting using LaMa (large-mask model).
     Requires:  pip install simple-lama-inpainting
+
+    Accepts any image mode — indexed/palette images are normalised before
+    processing so palette-transparency is preserved.
     """
     try:
         from simple_lama_inpainting import SimpleLama
@@ -315,11 +371,41 @@ def inpaint_lama(pil_img: Image.Image, pil_mask: Image.Image) -> Image.Image:
             "Run:  pip install simple-lama-inpainting\n"
             "Model weights (~200 MB) download automatically on first use.")
 
+    # Normalise mode: palette/indexed → RGBA or RGB before anything else
+    pil_img = normalise_image(pil_img)
+
     lama = SimpleLama()
-    rgb_img   = pil_img.convert("RGB")
+
     gray_mask = pil_mask.convert("L")
-    if gray_mask.size != rgb_img.size:
-        gray_mask = gray_mask.resize(rgb_img.size, Image.Resampling.NEAREST)
+    if gray_mask.size != pil_img.size:
+        gray_mask = gray_mask.resize(pil_img.size, Image.Resampling.NEAREST)
+
+    # ── Pre-fill transparent pixels before RGB conversion ────────────────────
+    # convert("RGB") maps alpha=0 pixels to black (0,0,0).  On small images
+    # or sprites (where most of the canvas is transparent), LaMa ends up
+    # seeing a tiny subject surrounded by a vast black field and interpolates
+    # towards black/grey inside the mask — producing the "grey pattern" bug.
+    #
+    # Fix: replace every transparent pixel with the colour of its nearest
+    # opaque neighbour BEFORE converting to RGB.  The transparent region is
+    # still kept out of LaMa's output via the alpha-restore step below.
+    if pil_img.mode == "RGBA":
+        rgba_arr  = np.array(pil_img, dtype=np.uint8)
+        alpha_ch  = rgba_arr[:, :, 3]
+        trans     = alpha_ch < 128
+        opaque    = ~trans
+
+        if trans.any() and opaque.any():
+            from scipy.ndimage import distance_transform_edt
+            _, (ny, nx) = distance_transform_edt(trans, return_indices=True)
+            rgb_filled = rgba_arr[:, :, :3].copy()
+            ys, xs = np.where(trans)
+            rgb_filled[ys, xs] = rgba_arr[ny[ys, xs], nx[ys, xs], :3]
+            rgb_img = Image.fromarray(rgb_filled, "RGB")
+        else:
+            rgb_img = pil_img.convert("RGB")
+    else:
+        rgb_img = pil_img.convert("RGB")
 
     result = lama(rgb_img, gray_mask)
 
@@ -347,28 +433,6 @@ def trim_outer_edge(pil_img: Image.Image,
                     ) -> "tuple[Image.Image, int, int]":
     """
     Remove the outermost layer of opaque pixels that form long, jagged edges.
-
-    These are the pixels that sit right at the boundary between opaque content
-    and transparency — the outer edge ring.  Setting them transparent effectively
-    trims a 1-pixel fringe of jaggies without touching any interior pixels.
-
-    Only opaque pixels that directly border the transparent background are ever
-    modified.  Interior pixels (surrounded by other opaque pixels on all sides)
-    are guaranteed to be untouched.
-
-    Parameters
-    ----------
-    min_length_pct        : minimum contour arc-length as % of image diagonal.
-                            Short contours (dots, tiny artifacts) are skipped.
-    straightness_threshold: arc/chord score cutoff.  Contours already close to
-                            a straight line (score >= threshold) are left alone.
-                            Lower = only trim very jagged edges.
-                            Higher = also trim mildly jagged edges.
-    trim_px               : how many outer-edge pixel layers to remove (1–3).
-
-    Returns
-    -------
-    (result_image_RGBA, contours_trimmed, pixels_removed)
     """
     if not CV2_AVAILABLE:
         raise RuntimeError("opencv-python is required for edge trimming.\n"
@@ -379,23 +443,20 @@ def trim_outer_edge(pil_img: Image.Image,
     h, w  = rgba.shape[:2]
     alpha = rgba[:, :, 3]
 
-    # ── 1. Outer-edge mask: opaque pixels that touch ≥1 transparent px ───────
     opaque_mask = (alpha >= 128).astype(np.uint8) * 255
     trans_mask  = (alpha  < 128).astype(np.uint8) * 255
     kernel_3    = np.ones((3, 3), np.uint8)
     trans_dilat = cv2.dilate(trans_mask, kernel_3, iterations=1)
-    edge_mask   = cv2.bitwise_and(opaque_mask, trans_dilat)   # 0/255
+    edge_mask   = cv2.bitwise_and(opaque_mask, trans_dilat)
 
     if edge_mask.max() == 0:
         return pil_img.convert("RGBA"), 0, 0
 
-    # ── 2. Find contours on the edge mask (every pixel) ──────────────────────
     contours, _ = cv2.findContours(edge_mask, cv2.RETR_LIST,
                                    cv2.CHAIN_APPROX_NONE)
     if not contours:
         return pil_img.convert("RGBA"), 0, 0
 
-    # ── 3. Filter: keep long + sufficiently jagged contours ──────────────────
     diagonal    = (h ** 2 + w ** 2) ** 0.5
     min_arc_len = diagonal * (min_length_pct / 100.0)
 
@@ -410,38 +471,31 @@ def trim_outer_edge(pil_img: Image.Image,
         start = pts[0].astype(float)
         end   = pts[-1].astype(float)
         chord = max(float(np.linalg.norm(end - start)), 1.0)
-        ratio = arc / chord                        # 1.0 = straight, >1 = jagged
+        ratio = arc / chord
         straightness_score = 1.0 / max(ratio, 1.0)
         if straightness_score >= straightness_threshold:
-            continue   # already straight — leave it alone
+            continue
         kept.append(cnt)
 
     if not kept:
         return pil_img.convert("RGBA"), 0, 0
 
-    # ── 4. Build a trim mask covering only the kept contour pixels ────────────
     trim_mask = np.zeros((h, w), dtype=np.uint8)
     for cnt in kept:
         cv2.drawContours(trim_mask, [cnt], -1, 255, thickness=trim_px)
 
-    # Safety: only erase pixels that are genuinely on the outer edge.
-    # AND with the full edge_mask so we can never touch interior pixels.
     trim_mask = cv2.bitwise_and(trim_mask, edge_mask)
 
-    # ── 5. Set those pixels to fully transparent ──────────────────────────────
     result = rgba.copy()
     ey, ex = np.where(trim_mask > 0)
-    result[ey, ex, 3] = 0          # alpha → 0 (transparent)
-    # Clear RGB too so no fringe shows up under semi-transparent compositing
+    result[ey, ex, 3] = 0
     result[ey, ex, :3] = 0
 
     return Image.fromarray(result, "RGBA"), len(kept), int(len(ey))
 
 
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  OUTLINE REDRAW  (straighten the outer edge in-place)
+#  OUTLINE REDRAW
 # ══════════════════════════════════════════════════════════════════════════════
 
 def redraw_outline(pil_img: Image.Image,
@@ -452,39 +506,7 @@ def redraw_outline(pil_img: Image.Image,
                    min_length_pct: float = 2.0,
                    ) -> "tuple[Image.Image, int, int]":
     """
-    Straighten the existing outer-edge outline in-place.
-
-    The outline stays exactly where it is — on the outermost opaque pixels
-    that touch the transparent background.  No pixels move inward.
-
-    Algorithm per contour
-    ---------------------
-    1. Detect outer-edge pixels (opaque touching transparent).
-    2. Simplify the contour with Douglas-Peucker → a clean polyline of
-       key vertices that approximates the same path with fewer corners.
-    3. For every original edge pixel, find the nearest point on the
-       simplified polyline.  Recolour that pixel with either the dominant
-       colour sampled from the contour itself (auto) or a custom colour.
-       The pixel's *position* never changes — only its colour is updated.
-    4. Additionally draw the simplified polyline segments directly onto
-       the edge mask region (clipped to existing opaque pixels), filling
-       any small gaps left after trimming.
-
-    Result: the outline is in the same place but the colour is applied in
-    a geometrically smooth pattern rather than a jagged staircase.
-
-    Parameters
-    ----------
-    epsilon_pct    : Douglas-Peucker tolerance as % of contour arc-length.
-    color_mode     : "auto" → dominant colour of the contour's own pixels
-                     "custom" → custom_color (R,G,B)
-    custom_color   : (R,G,B) tuple for custom mode.
-    thickness      : how many px wide to paint along the simplified path.
-    min_length_pct : skip contours shorter than this % of image diagonal.
-
-    Returns
-    -------
-    (result_image_RGBA, contours_processed, pixels_painted)
+    Straighten the existing outer-edge outline in-place using Douglas-Peucker.
     """
     if not CV2_AVAILABLE:
         raise RuntimeError("opencv-python is required for outline redraw.\n"
@@ -495,12 +517,11 @@ def redraw_outline(pil_img: Image.Image,
     h, w  = rgba.shape[:2]
     alpha = rgba[:, :, 3]
 
-    # ── 1. Outer-edge mask (same definition as trim step) ────────────────────
     opaque_mask = (alpha >= 128).astype(np.uint8) * 255
     trans_mask  = (alpha  < 128).astype(np.uint8) * 255
     kernel_3    = np.ones((3, 3), np.uint8)
     trans_dilat = cv2.dilate(trans_mask, kernel_3, iterations=1)
-    edge_mask   = cv2.bitwise_and(opaque_mask, trans_dilat)   # 0/255
+    edge_mask   = cv2.bitwise_and(opaque_mask, trans_dilat)
 
     if edge_mask.max() == 0:
         return pil_img.convert("RGBA"), 0, 0
@@ -522,9 +543,8 @@ def redraw_outline(pil_img: Image.Image,
         if arc < min_arc_len:
             continue
 
-        pts = cnt[:, 0, :].astype(np.float32)   # (N, 2) float x,y
+        pts = cnt[:, 0, :].astype(np.float32)
 
-        # ── 2. Sample contour's own dominant colour ───────────────────────────
         if color_mode == "custom" and custom_color is not None:
             draw_color = np.array([*custom_color, 255], dtype=np.uint8)
         else:
@@ -535,47 +555,34 @@ def redraw_outline(pil_img: Image.Image,
             most_common = Counter(own).most_common(1)[0][0]
             draw_color  = np.array([*most_common, 255], dtype=np.uint8)
 
-        # ── 3. Douglas-Peucker simplification ────────────────────────────────
         epsilon    = max(1.0, arc * (epsilon_pct / 100.0))
         simplified = cv2.approxPolyDP(cnt, epsilon=epsilon, closed=False)
-        pts_s      = simplified[:, 0, :].astype(np.float32)   # (M, 2)
+        pts_s      = simplified[:, 0, :].astype(np.float32)
 
         if len(pts_s) < 2:
             continue
 
-        # ── 4. Build the simplified polyline as a list of segments ────────────
-        # segments: list of (A, B) where A,B are (x,y) float points
         segments = [(pts_s[i], pts_s[i + 1]) for i in range(len(pts_s) - 1)]
 
-        # ── 5. For each original edge pixel, find nearest point on polyline ───
-        # and recolour it.  The pixel stays in place — we only update its RGB.
         edge_ys, edge_xs = np.where(edge_mask > 0)
         if len(edge_ys) == 0:
             continue
 
-        # Vectorised nearest-point-on-segment calculation
-        # For each edge pixel P and each segment AB, project P onto AB.
-        P = np.stack([edge_xs, edge_ys], axis=1).astype(np.float32)  # (K,2)
-
+        P = np.stack([edge_xs, edge_ys], axis=1).astype(np.float32)
         min_dist_sq = np.full(len(P), np.inf, dtype=np.float32)
 
         for A, B in segments:
-            AB   = B - A                          # (2,)
+            AB    = B - A
             AB_sq = float(np.dot(AB, AB))
             if AB_sq < 1e-6:
-                # Degenerate segment — use point distance to A
                 d_sq = np.sum((P - A) ** 2, axis=1)
             else:
-                # t = dot(AP, AB) / |AB|^2, clamped to [0,1]
-                AP = P - A                        # (K,2)
-                t  = np.clip(AP @ AB / AB_sq, 0.0, 1.0)  # (K,)
-                proj = A + np.outer(t, AB)        # (K,2) nearest point on seg
+                AP   = P - A
+                t    = np.clip(AP @ AB / AB_sq, 0.0, 1.0)
+                proj = A + np.outer(t, AB)
                 d_sq = np.sum((P - proj) ** 2, axis=1)
-
             min_dist_sq = np.minimum(min_dist_sq, d_sq)
 
-        # Keep only pixels whose nearest point on the simplified path is
-        # within `thickness` pixels — this preserves the edge position.
         near = min_dist_sq <= (thickness + 0.5) ** 2
         ys_v = edge_ys[near]
         xs_v = edge_xs[near]
@@ -585,7 +592,6 @@ def redraw_outline(pil_img: Image.Image,
         drawn += 1
 
     return Image.fromarray(result, "RGBA"), drawn, total_pixels
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -643,7 +649,7 @@ class DropZone(Frame):
         self.on_file  = on_file
         self.multi    = multi
         self.accept   = accept or [("Image files",
-                                    "*.png *.jpg *.jpeg *.bmp *.tiff *.webp")]
+                                    "*.png *.jpg *.jpeg *.bmp *.tiff *.webp *.gif")]
         self._paths   = []
 
         inner = Frame(self, bg=SURFACE)
@@ -737,7 +743,8 @@ class ThumbnailStrip(Frame):
         cap = 50
         for p in paths[:cap]:
             try:
-                img = Image.open(p).convert("RGBA")
+                img = Image.open(p)
+                img = normalise_image(img)   # handle indexed images in thumbnails too
                 img.thumbnail((66, 66))
                 tk_img = ImageTk.PhotoImage(img)
                 Label(self.inner, image=tk_img, bg=PANEL,
@@ -763,8 +770,8 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         super().__init__()
         self.title("Batch Content-Aware Inpainter")
         self.configure(bg=BG)
-        self.geometry("920x900")
-        self.minsize(800, 750)
+        self.geometry("1100x1000")
+        self.minsize(960, 820)
 
         s = ttk.Style(self)
         s.theme_use("clam")
@@ -779,15 +786,13 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self._mask_dilation = IntVar(value=0)
         self._fill_holes      = BooleanVar(value=False)
         self._exclude_dark    = BooleanVar(value=False)
-        self._dark_threshold  = IntVar(value=30)   # luminance 0-255
-        # trim outer edge
+        self._dark_threshold  = IntVar(value=30)
         self._smooth_outlines          = BooleanVar(value=False)
         self._outline_min_len          = DoubleVar(value=5.0)
         self._outline_straightness_pct = IntVar(value=90)
         self._outline_trim_px          = IntVar(value=1)
-        # redraw outline
         self._redraw_outline           = BooleanVar(value=False)
-        self._redraw_epsilon_x10       = IntVar(value=20)   # ×10, so 20 = 2.0%
+        self._redraw_epsilon_x10       = IntVar(value=20)
         self._redraw_color_mode        = StringVar(value="auto")
         self._redraw_custom_rgb        = (0, 0, 0)
         self._redraw_thickness         = IntVar(value=1)
@@ -853,14 +858,25 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         left_vsb.pack(side=RIGHT, fill=Y)
         left_canvas.pack(side=LEFT, fill=BOTH, expand=True)
         left = Frame(left_canvas, bg=BG)
-        left_canvas.create_window((0, 0), window=left, anchor="nw")
+        left_win = left_canvas.create_window((0, 0), window=left, anchor="nw")
 
-        def _on_left_configure(e):
+        def _sync_left_width(e=None):
+            # Keep the inner frame exactly as wide as the visible canvas so
+            # widgets fill the column and are visible from the first render.
+            w = left_canvas.winfo_width()
+            if w > 1:
+                left_canvas.itemconfigure(left_win, width=w)
+
+        def _on_left_frame_configure(e):
+            # Update scroll region whenever inner content changes size.
             left_canvas.configure(scrollregion=left_canvas.bbox("all"))
-            left_canvas.itemconfigure(1, width=left_canvas.winfo_width())
-        left.bind("<Configure>", _on_left_configure)
 
-        # Mouse-wheel scroll on left panel
+        left.bind("<Configure>", _on_left_frame_configure)
+        # Re-sync width whenever the canvas itself is resized.
+        left_canvas.bind("<Configure>", _sync_left_width)
+        # Fire once after layout is complete so content is visible on launch.
+        self.after_idle(_sync_left_width)
+
         def _on_mousewheel(e):
             left_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
         left_canvas.bind_all("<MouseWheel>", _on_mousewheel)
@@ -893,7 +909,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                                   multi=False, on_file=self._on_mask, height=90)
         self.mask_drop.pack(fill=X)
 
-        # Mask clear button
         mask_btn_row = Frame(left, bg=BG)
         mask_btn_row.pack(fill=X, pady=(4, 0))
         styled_btn(mask_btn_row, "Clear mask",
@@ -945,7 +960,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             justify=LEFT, wraplength=340)
         self.hole_desc.pack(anchor=W, padx=14, pady=(0, 6))
 
-        # Exclude-dark row
         dark_row = Frame(hole_card, bg=SURFACE2)
         dark_row.pack(fill=X, padx=10, pady=(0, 4))
 
@@ -969,7 +983,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             "opaque pixel is used as a fallback so holes are always filled."
         ).pack(side=LEFT, padx=4)
 
-        # Threshold slider — shown/hidden via _on_exclude_dark_change
         self.dark_thresh_frame = Frame(hole_card, bg=SURFACE2)
         thresh_lbl_row = Frame(self.dark_thresh_frame, bg=SURFACE2)
         thresh_lbl_row.pack(fill=X, padx=14)
@@ -991,7 +1004,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                              highlightthickness=1, highlightbackground=BORDER)
         outline_card.pack(fill=X)
 
-        # Enable checkbox
         outline_top = Frame(outline_card, bg=SURFACE2)
         outline_top.pack(fill=X, padx=10, pady=(8, 4))
         Checkbutton(
@@ -1014,10 +1026,8 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             "sliders below to control which edges are trimmed."
         ).pack(side=RIGHT, padx=6)
 
-        # Sub-controls frame (shown/hidden)
         self.outline_controls = Frame(outline_card, bg=SURFACE2)
 
-        # Min length
         len_row = Frame(self.outline_controls, bg=SURFACE2)
         len_row.pack(fill=X, padx=10, pady=(4, 0))
         lh = Frame(len_row, bg=SURFACE2)
@@ -1038,7 +1048,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
               sliderrelief="flat", font=FONT_SMALL,
               showvalue=True).pack(fill=X)
 
-        # Straightness filter
         str_row = Frame(self.outline_controls, bg=SURFACE2)
         str_row.pack(fill=X, padx=10, pady=(4, 0))
         sh = Frame(str_row, bg=SURFACE2)
@@ -1063,7 +1072,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         Label(str_row, text="(×100 — e.g. 90 = skip edges with score ≥ 0.90)",
               font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(anchor=W)
 
-        # Trim depth
         trim_row = Frame(self.outline_controls, bg=SURFACE2)
         trim_row.pack(fill=X, padx=10, pady=(6, 8))
         Label(trim_row, text="Trim depth", font=FONT_SMALL,
@@ -1103,10 +1111,8 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             "Best used AFTER Trim Outer Edge."
         ).pack(side=RIGHT, padx=6)
 
-        # Sub-controls (shown/hidden)
         self.redraw_controls = Frame(redraw_card, bg=SURFACE2)
 
-        # Simplification strength
         eps_row = Frame(self.redraw_controls, bg=SURFACE2)
         eps_row.pack(fill=X, padx=10, pady=(4, 0))
         eps_hdr = Frame(eps_row, bg=SURFACE2)
@@ -1129,7 +1135,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         Label(eps_row, text="(×10 — e.g. 20 = 2.0% tolerance)",
               font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(anchor=W)
 
-        # Min length
         rlen_row = Frame(self.redraw_controls, bg=SURFACE2)
         rlen_row.pack(fill=X, padx=10, pady=(4, 0))
         rlh = Frame(rlen_row, bg=SURFACE2)
@@ -1147,7 +1152,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
               sliderrelief="flat", font=FONT_SMALL,
               showvalue=True).pack(fill=X)
 
-        # Thickness
         rthick_row = Frame(self.redraw_controls, bg=SURFACE2)
         rthick_row.pack(fill=X, padx=10, pady=(6, 0))
         Label(rthick_row, text="Line thickness", font=FONT_SMALL,
@@ -1159,7 +1163,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         Label(rthick_row, text="px  (1 recommended for pixel art)",
               font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
 
-        # Color mode
         rcol_hdr = Frame(self.redraw_controls, bg=SURFACE2)
         rcol_hdr.pack(fill=X, padx=10, pady=(8, 2))
         Label(rcol_hdr, text="COLOUR SOURCE", font=FONT_LABEL,
@@ -1186,7 +1189,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                     activebackground=SURFACE2, activeforeground=ACCENT,
                     font=FONT_BODY).pack(side=LEFT, padx=(12, 0))
 
-        # Custom color picker (shown when "custom")
         self.redraw_color_row = Frame(self.redraw_controls, bg=SURFACE2)
         Label(self.redraw_color_row, text="Color:", font=FONT_SMALL,
               bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT, padx=(10, 4))
@@ -1231,7 +1233,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                         padx=10, pady=7).pack(side=LEFT, fill=X, expand=True)
             TooltipLabel(row, tip).pack(side=RIGHT, padx=6)
 
-        # Radius (CV2 only)
         self.radius_frame = Frame(right, bg=BG)
         self.radius_frame.pack(fill=X, pady=(10, 0))
         r_hdr = Frame(self.radius_frame, bg=BG)
@@ -1248,7 +1249,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
               sliderrelief="flat", font=FONT_SMALL,
               showvalue=True).pack(fill=X)
 
-        # Mask dilation
         SectionLabel(right, "MASK REFINEMENT").pack(fill=X, pady=(12, 4))
         dil_row = Frame(right, bg=BG)
         dil_row.pack(fill=X)
@@ -1261,7 +1261,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         Label(dil_row, text="px  (reduces halo edges)",
               font=FONT_SMALL, bg=BG, fg=SUBTEXT).pack(side=LEFT)
 
-        # Output folder
         SectionLabel(right, "OUTPUT FOLDER").pack(fill=X, pady=(12, 4))
         out_row = Frame(right, bg=BG)
         out_row.pack(fill=X)
@@ -1273,7 +1272,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         styled_btn(out_row, "…", self._browse_output,
                    small=True).pack(side=LEFT, padx=(4, 0))
 
-        # Run / Cancel
         btn_row = Frame(right, bg=BG)
         btn_row.pack(fill=X, pady=(16, 4))
         self.run_btn = Button(btn_row, text="▶  PROCESS  IMAGE(S)",
@@ -1290,14 +1288,12 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                                  cursor="hand2", state=DISABLED)
         self.cancel_btn.pack(side=LEFT, padx=(4, 0))
 
-        # Progress + status
         self.progress = ttk.Progressbar(right, mode="determinate")
         self.progress.pack(fill=X, pady=(0, 4))
         self.status_lbl = Label(right, text="Ready.", font=FONT_SMALL,
                                 bg=BG, fg=SUBTEXT, anchor=W, wraplength=320)
         self.status_lbl.pack(fill=X)
 
-        # Log
         SectionLabel(right, "LOG").pack(fill=X, pady=(10, 4))
         log_wrap = Frame(right, bg=SURFACE,
                          highlightthickness=1, highlightbackground=BORDER)
@@ -1497,7 +1493,21 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                 self._log("Cancelled by user.", "warn")
                 break
             try:
-                src = Image.open(p)
+                raw = Image.open(p)
+
+                # ── Normalise indexed/palette images immediately after open ──
+                # Modes P and PA store colours in a palette; transparency may
+                # be encoded as a palette-index rather than a real alpha
+                # channel.  normalise_image() converts to RGBA (transparency
+                # present) or RGB (no transparency) so every downstream step —
+                # mask inpainting, hole fill, edge trim, outline redraw — gets
+                # a consistent pixel format without palette surprises.
+                original_mode = raw.mode
+                src = normalise_image(raw)
+                if src.mode != original_mode:
+                    self._log(
+                        f"  Indexed image: converted {original_mode} → {src.mode}  "
+                        f"({Path(p).name})")
 
                 self.after(0, self.status_lbl.configure,
                            {"text": f"[{i+1}/{len(self._image_paths)}] {Path(p).name}…",
@@ -1518,7 +1528,6 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
 
                 # ── Step 2: fill interior transparent holes ──────────────
                 if fill_holes_on:
-                    # Diagnose image mode first
                     self._log(f"  mode:{result.mode} size:{result.size[0]}x{result.size[1]}")
                     alpha_dbg = _get_alpha(result)
                     if alpha_dbg is None:
@@ -1614,4 +1623,3 @@ if __name__ == "__main__":
         print("Tip: pip install tkinterdnd2  →  enables drag-and-drop")
     app = InpaintApp()
     app.mainloop()
-    # this is a test comment
