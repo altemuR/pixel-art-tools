@@ -440,6 +440,158 @@ def trim_outer_edge(pil_img: Image.Image,
 
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  OUTLINE REDRAW  (straighten the outer edge in-place)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def redraw_outline(pil_img: Image.Image,
+                   epsilon_pct: float = 2.0,
+                   color_mode: str = "auto",
+                   custom_color: "tuple[int,int,int] | None" = None,
+                   thickness: int = 1,
+                   min_length_pct: float = 2.0,
+                   ) -> "tuple[Image.Image, int, int]":
+    """
+    Straighten the existing outer-edge outline in-place.
+
+    The outline stays exactly where it is — on the outermost opaque pixels
+    that touch the transparent background.  No pixels move inward.
+
+    Algorithm per contour
+    ---------------------
+    1. Detect outer-edge pixels (opaque touching transparent).
+    2. Simplify the contour with Douglas-Peucker → a clean polyline of
+       key vertices that approximates the same path with fewer corners.
+    3. For every original edge pixel, find the nearest point on the
+       simplified polyline.  Recolour that pixel with either the dominant
+       colour sampled from the contour itself (auto) or a custom colour.
+       The pixel's *position* never changes — only its colour is updated.
+    4. Additionally draw the simplified polyline segments directly onto
+       the edge mask region (clipped to existing opaque pixels), filling
+       any small gaps left after trimming.
+
+    Result: the outline is in the same place but the colour is applied in
+    a geometrically smooth pattern rather than a jagged staircase.
+
+    Parameters
+    ----------
+    epsilon_pct    : Douglas-Peucker tolerance as % of contour arc-length.
+    color_mode     : "auto" → dominant colour of the contour's own pixels
+                     "custom" → custom_color (R,G,B)
+    custom_color   : (R,G,B) tuple for custom mode.
+    thickness      : how many px wide to paint along the simplified path.
+    min_length_pct : skip contours shorter than this % of image diagonal.
+
+    Returns
+    -------
+    (result_image_RGBA, contours_processed, pixels_painted)
+    """
+    if not CV2_AVAILABLE:
+        raise RuntimeError("opencv-python is required for outline redraw.\n"
+                           "Run: pip install opencv-python")
+    assert cv2 is not None
+
+    rgba  = np.array(pil_img.convert("RGBA"), dtype=np.uint8)
+    h, w  = rgba.shape[:2]
+    alpha = rgba[:, :, 3]
+
+    # ── 1. Outer-edge mask (same definition as trim step) ────────────────────
+    opaque_mask = (alpha >= 128).astype(np.uint8) * 255
+    trans_mask  = (alpha  < 128).astype(np.uint8) * 255
+    kernel_3    = np.ones((3, 3), np.uint8)
+    trans_dilat = cv2.dilate(trans_mask, kernel_3, iterations=1)
+    edge_mask   = cv2.bitwise_and(opaque_mask, trans_dilat)   # 0/255
+
+    if edge_mask.max() == 0:
+        return pil_img.convert("RGBA"), 0, 0
+
+    contours, _ = cv2.findContours(edge_mask, cv2.RETR_LIST,
+                                   cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return pil_img.convert("RGBA"), 0, 0
+
+    diagonal    = (h ** 2 + w ** 2) ** 0.5
+    min_arc_len = diagonal * (min_length_pct / 100.0)
+
+    result       = rgba.copy()
+    total_pixels = 0
+    drawn        = 0
+
+    for cnt in contours:
+        arc = cv2.arcLength(cnt, closed=False)
+        if arc < min_arc_len:
+            continue
+
+        pts = cnt[:, 0, :].astype(np.float32)   # (N, 2) float x,y
+
+        # ── 2. Sample contour's own dominant colour ───────────────────────────
+        if color_mode == "custom" and custom_color is not None:
+            draw_color = np.array([*custom_color, 255], dtype=np.uint8)
+        else:
+            from collections import Counter
+            cys = pts[:, 1].clip(0, h - 1).astype(int)
+            cxs = pts[:, 0].clip(0, w - 1).astype(int)
+            own = [tuple(rgba[cy, cx, :3].tolist()) for cy, cx in zip(cys, cxs)]
+            most_common = Counter(own).most_common(1)[0][0]
+            draw_color  = np.array([*most_common, 255], dtype=np.uint8)
+
+        # ── 3. Douglas-Peucker simplification ────────────────────────────────
+        epsilon    = max(1.0, arc * (epsilon_pct / 100.0))
+        simplified = cv2.approxPolyDP(cnt, epsilon=epsilon, closed=False)
+        pts_s      = simplified[:, 0, :].astype(np.float32)   # (M, 2)
+
+        if len(pts_s) < 2:
+            continue
+
+        # ── 4. Build the simplified polyline as a list of segments ────────────
+        # segments: list of (A, B) where A,B are (x,y) float points
+        segments = [(pts_s[i], pts_s[i + 1]) for i in range(len(pts_s) - 1)]
+
+        # ── 5. For each original edge pixel, find nearest point on polyline ───
+        # and recolour it.  The pixel stays in place — we only update its RGB.
+        edge_ys, edge_xs = np.where(edge_mask > 0)
+        if len(edge_ys) == 0:
+            continue
+
+        # Vectorised nearest-point-on-segment calculation
+        # For each edge pixel P and each segment AB, project P onto AB.
+        P = np.stack([edge_xs, edge_ys], axis=1).astype(np.float32)  # (K,2)
+
+        min_dist_sq = np.full(len(P), np.inf, dtype=np.float32)
+
+        for A, B in segments:
+            AB   = B - A                          # (2,)
+            AB_sq = float(np.dot(AB, AB))
+            if AB_sq < 1e-6:
+                # Degenerate segment — use point distance to A
+                d_sq = np.sum((P - A) ** 2, axis=1)
+            else:
+                # t = dot(AP, AB) / |AB|^2, clamped to [0,1]
+                AP = P - A                        # (K,2)
+                t  = np.clip(AP @ AB / AB_sq, 0.0, 1.0)  # (K,)
+                proj = A + np.outer(t, AB)        # (K,2) nearest point on seg
+                d_sq = np.sum((P - proj) ** 2, axis=1)
+
+            min_dist_sq = np.minimum(min_dist_sq, d_sq)
+
+        # Keep only pixels whose nearest point on the simplified path is
+        # within `thickness` pixels — this preserves the edge position.
+        near = min_dist_sq <= (thickness + 0.5) ** 2
+        ys_v = edge_ys[near]
+        xs_v = edge_xs[near]
+
+        result[ys_v, xs_v] = draw_color
+        total_pixels += int(len(ys_v))
+        drawn += 1
+
+    return Image.fromarray(result, "RGBA"), drawn, total_pixels
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  WIDGETS
+# ══════════════════════════════════════════════════════════════════════════════
+
 def styled_btn(parent, text, command, primary=False, small=False):
     bg  = ACCENT  if primary else SURFACE2
     abg = ACCENT2 if primary else BORDER
@@ -630,9 +782,16 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         self._dark_threshold  = IntVar(value=30)   # luminance 0-255
         # trim outer edge
         self._smooth_outlines          = BooleanVar(value=False)
-        self._outline_min_len          = DoubleVar(value=5.0)   # % of diagonal
-        self._outline_straightness_pct = IntVar(value=90)       # slider 50–99
-        self._outline_trim_px          = IntVar(value=1)        # layers to remove
+        self._outline_min_len          = DoubleVar(value=5.0)
+        self._outline_straightness_pct = IntVar(value=90)
+        self._outline_trim_px          = IntVar(value=1)
+        # redraw outline
+        self._redraw_outline           = BooleanVar(value=False)
+        self._redraw_epsilon_x10       = IntVar(value=20)   # ×10, so 20 = 2.0%
+        self._redraw_color_mode        = StringVar(value="auto")
+        self._redraw_custom_rgb        = (0, 0, 0)
+        self._redraw_thickness         = IntVar(value=1)
+        self._redraw_min_len           = DoubleVar(value=2.0)
         self._cancel_flag              = threading.Event()
 
         self._build_ui()
@@ -681,10 +840,30 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         body.columnconfigure(1, weight=2, minsize=300)
         body.rowconfigure(0, weight=1)
 
-        left  = Frame(body, bg=BG)
+        left_outer = Frame(body, bg=BG)
         right = Frame(body, bg=BG)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        left_outer.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         right.grid(row=0, column=1, sticky="nsew")
+
+        # Scrollable left column
+        left_canvas = Canvas(left_outer, bg=BG, bd=0, highlightthickness=0)
+        left_vsb    = ttk.Scrollbar(left_outer, orient=VERTICAL,
+                                    command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_vsb.set)
+        left_vsb.pack(side=RIGHT, fill=Y)
+        left_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        left = Frame(left_canvas, bg=BG)
+        left_canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _on_left_configure(e):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+            left_canvas.itemconfigure(1, width=left_canvas.winfo_width())
+        left.bind("<Configure>", _on_left_configure)
+
+        # Mouse-wheel scroll on left panel
+        def _on_mousewheel(e):
+            left_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        left_canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         # ── LEFT column ───────────────────────────────────────────────────────
         SectionLabel(left, "SOURCE IMAGES").pack(fill=X, pady=(0, 4))
@@ -896,6 +1075,132 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         Label(trim_row, text="px  (outer layers to remove)",
               font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
 
+        # ── Redraw Outline panel ──────────────────────────────────────────────
+        SectionLabel(left, "REDRAW OUTLINE").pack(fill=X, pady=(14, 4))
+
+        redraw_card = Frame(left, bg=SURFACE2,
+                            highlightthickness=1, highlightbackground=BORDER)
+        redraw_card.pack(fill=X)
+
+        redraw_top = Frame(redraw_card, bg=SURFACE2)
+        redraw_top.pack(fill=X, padx=10, pady=(8, 4))
+        Checkbutton(
+            redraw_top,
+            text="Redraw Outline  —  draw a clean geometric outline",
+            variable=self._redraw_outline,
+            command=self._on_redraw_outline_change,
+            bg=SURFACE2, fg=TEXT, selectcolor=SURFACE,
+            activebackground=SURFACE2, activeforeground=ACCENT,
+            font=FONT_BODY, anchor=W).pack(side=LEFT, fill=X, expand=True)
+        TooltipLabel(
+            redraw_top,
+            "After trimming, draws a new clean outline along the current\n"
+            "outer edge using Douglas-Peucker simplification.\n\n"
+            "The outline colour is sampled from the edge pixels themselves\n"
+            "so no new colour is introduced — or you can pick a fixed colour.\n\n"
+            "Lines are drawn only onto already-opaque pixels, so the\n"
+            "transparent background is never touched.\n\n"
+            "Best used AFTER Trim Outer Edge."
+        ).pack(side=RIGHT, padx=6)
+
+        # Sub-controls (shown/hidden)
+        self.redraw_controls = Frame(redraw_card, bg=SURFACE2)
+
+        # Simplification strength
+        eps_row = Frame(self.redraw_controls, bg=SURFACE2)
+        eps_row.pack(fill=X, padx=10, pady=(4, 0))
+        eps_hdr = Frame(eps_row, bg=SURFACE2)
+        eps_hdr.pack(fill=X)
+        Label(eps_hdr, text="SIMPLIFICATION STRENGTH", font=FONT_LABEL,
+              bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+        TooltipLabel(eps_hdr,
+            "Douglas-Peucker tolerance as % of each contour's arc-length.\n\n"
+            "Low (5)  = subtle — preserves most corners, minor cleanup.\n"
+            "High (50) = aggressive — reduces to few long straight segments.\n\n"
+            "Value shown ×10, so 20 = 2.0% tolerance.\n"
+            "Recommended: 15–30 for pixel art."
+        ).pack(side=LEFT, padx=4)
+        Scale(eps_row, from_=5, to=100, resolution=1, orient=HORIZONTAL,
+              variable=self._redraw_epsilon_x10,
+              bg=SURFACE2, fg=TEXT, troughcolor=SURFACE,
+              highlightthickness=0, activebackground=ACCENT,
+              sliderrelief="flat", font=FONT_SMALL,
+              showvalue=True).pack(fill=X)
+        Label(eps_row, text="(×10 — e.g. 20 = 2.0% tolerance)",
+              font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(anchor=W)
+
+        # Min length
+        rlen_row = Frame(self.redraw_controls, bg=SURFACE2)
+        rlen_row.pack(fill=X, padx=10, pady=(4, 0))
+        rlh = Frame(rlen_row, bg=SURFACE2)
+        rlh.pack(fill=X)
+        Label(rlh, text="MIN SEGMENT LENGTH", font=FONT_LABEL,
+              bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+        TooltipLabel(rlh,
+            "Skip contours shorter than this % of image diagonal.\n"
+            "Keeps tiny dots and specks from being redrawn."
+        ).pack(side=LEFT, padx=4)
+        Scale(rlen_row, from_=1, to=20, resolution=1, orient=HORIZONTAL,
+              variable=self._redraw_min_len,
+              bg=SURFACE2, fg=TEXT, troughcolor=SURFACE,
+              highlightthickness=0, activebackground=ACCENT,
+              sliderrelief="flat", font=FONT_SMALL,
+              showvalue=True).pack(fill=X)
+
+        # Thickness
+        rthick_row = Frame(self.redraw_controls, bg=SURFACE2)
+        rthick_row.pack(fill=X, padx=10, pady=(6, 0))
+        Label(rthick_row, text="Line thickness", font=FONT_SMALL,
+              bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+        Spinbox(rthick_row, from_=1, to=3, textvariable=self._redraw_thickness,
+                width=3, bg=SURFACE, fg=TEXT,
+                buttonbackground=SURFACE2, relief="flat",
+                font=FONT_BODY, insertbackground=TEXT).pack(side=LEFT, padx=6)
+        Label(rthick_row, text="px  (1 recommended for pixel art)",
+              font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+
+        # Color mode
+        rcol_hdr = Frame(self.redraw_controls, bg=SURFACE2)
+        rcol_hdr.pack(fill=X, padx=10, pady=(8, 2))
+        Label(rcol_hdr, text="COLOUR SOURCE", font=FONT_LABEL,
+              bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT)
+        TooltipLabel(rcol_hdr,
+            "Auto: reads the dominant colour of the edge pixels themselves.\n"
+            "No new colour is introduced — uses what's already there.\n\n"
+            "Custom: override with a colour you pick.\n"
+            "Useful when edges have mixed or noisy colours."
+        ).pack(side=LEFT, padx=4)
+
+        rcol_row = Frame(self.redraw_controls, bg=SURFACE2)
+        rcol_row.pack(fill=X, padx=10, pady=(0, 4))
+        Radiobutton(rcol_row, text="Auto  (sample edge colour)",
+                    variable=self._redraw_color_mode, value="auto",
+                    command=self._on_redraw_color_mode_change,
+                    bg=SURFACE2, fg=TEXT, selectcolor=SURFACE,
+                    activebackground=SURFACE2, activeforeground=ACCENT,
+                    font=FONT_BODY).pack(side=LEFT)
+        Radiobutton(rcol_row, text="Custom",
+                    variable=self._redraw_color_mode, value="custom",
+                    command=self._on_redraw_color_mode_change,
+                    bg=SURFACE2, fg=TEXT, selectcolor=SURFACE,
+                    activebackground=SURFACE2, activeforeground=ACCENT,
+                    font=FONT_BODY).pack(side=LEFT, padx=(12, 0))
+
+        # Custom color picker (shown when "custom")
+        self.redraw_color_row = Frame(self.redraw_controls, bg=SURFACE2)
+        Label(self.redraw_color_row, text="Color:", font=FONT_SMALL,
+              bg=SURFACE2, fg=SUBTEXT).pack(side=LEFT, padx=(10, 4))
+        self.redraw_swatch = Label(self.redraw_color_row, width=4, bg="#000000",
+                                   relief="flat", highlightthickness=1,
+                                   highlightbackground=BORDER)
+        self.redraw_swatch.pack(side=LEFT)
+        self.redraw_hex_lbl = Label(self.redraw_color_row, text="#000000",
+                                    font=FONT_SMALL, bg=SURFACE2, fg=SUBTEXT)
+        self.redraw_hex_lbl.pack(side=LEFT, padx=6)
+        styled_btn(self.redraw_color_row, "Pick…",
+                   self._pick_redraw_color, small=True).pack(side=LEFT, padx=(4, 10))
+        Frame(self.redraw_controls, bg=SURFACE2, height=6).pack()
+
         # ── RIGHT column ──────────────────────────────────────────────────────
         SectionLabel(right, "INPAINTING ENGINE").pack(fill=X, pady=(0, 6))
 
@@ -1075,6 +1380,32 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
             self.outline_controls.pack_forget()
             self._log("Trim Outer Edge disabled.")
 
+    def _on_redraw_outline_change(self):
+        if self._redraw_outline.get():
+            self.redraw_controls.pack(fill=X)
+            self._log("Redraw Outline enabled.")
+        else:
+            self.redraw_controls.pack_forget()
+            self._log("Redraw Outline disabled.")
+
+    def _on_redraw_color_mode_change(self):
+        if self._redraw_color_mode.get() == "custom":
+            self.redraw_color_row.pack(fill=X, pady=(0, 4))
+        else:
+            self.redraw_color_row.pack_forget()
+
+    def _pick_redraw_color(self):
+        from tkinter import colorchooser
+        init = "#{:02x}{:02x}{:02x}".format(*self._redraw_custom_rgb)
+        res  = colorchooser.askcolor(color=init, title="Choose outline colour")
+        if res and res[0]:
+            r, g, b = (int(c) for c in res[0])
+            self._redraw_custom_rgb = (r, g, b)
+            hex_str = "#{:02x}{:02x}{:02x}".format(r, g, b)
+            self.redraw_swatch.configure(bg=hex_str)
+            self.redraw_hex_lbl.configure(text=hex_str)
+            self._log(f"Redraw colour set to {hex_str}  RGB({r},{g},{b})")
+
     def _browse_output(self):
         d = filedialog.askdirectory(title="Select output folder")
         if d:
@@ -1089,11 +1420,12 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         has_mask           = bool(self._mask_path)
         fill_holes_on      = self._fill_holes.get()
         smooth_outlines_on = self._smooth_outlines.get()
+        redraw_outline_on  = self._redraw_outline.get()
 
-        if not has_mask and not fill_holes_on and not smooth_outlines_on:
+        if not has_mask and not fill_holes_on and not smooth_outlines_on and not redraw_outline_on:
             messagebox.showwarning(
                 "Nothing to do",
-                "Please either load a mask, enable 'Fill Holes', or enable 'Trim Outer Edge'.")
+                "Please load a mask or enable at least one processing step.")
             return
 
         backend = self._backend.get()
@@ -1133,6 +1465,12 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
         outline_min_len      = float(self._outline_min_len.get())
         outline_straightness = self._outline_straightness_pct.get() / 100.0
         outline_trim_px      = self._outline_trim_px.get()
+        redraw_outline_on    = self._redraw_outline.get()
+        redraw_epsilon_pct   = self._redraw_epsilon_x10.get() / 10.0
+        redraw_color_mode    = self._redraw_color_mode.get()
+        redraw_custom_rgb    = self._redraw_custom_rgb
+        redraw_thickness     = self._redraw_thickness.get()
+        redraw_min_len       = float(self._redraw_min_len.get())
 
         # Load and optionally dilate the user-supplied mask once
         mask_pil: "Image.Image | None" = None
@@ -1217,6 +1555,23 @@ class InpaintApp(TkinterDnD.Tk if DND_AVAILABLE else Tk):  # type: ignore[misc]
                     else:
                         self._log(f"  Trimmed {n_edges} edge segment(s), {n_px} px removed", "good")
 
+                # ── Step 4: redraw clean outline ─────────────────────────
+                if redraw_outline_on:
+                    self._log(f"  Redraw outline (epsilon={redraw_epsilon_pct:.1f}%, "
+                              f"min={redraw_min_len:.1f}% diag, "
+                              f"color={redraw_color_mode}, thick={redraw_thickness}px)…")
+                    result, n_drawn, n_px2 = redraw_outline(
+                        result,
+                        epsilon_pct=redraw_epsilon_pct,
+                        color_mode=redraw_color_mode,
+                        custom_color=redraw_custom_rgb if redraw_color_mode == "custom" else None,
+                        thickness=redraw_thickness,
+                        min_length_pct=redraw_min_len)
+                    if n_drawn == 0:
+                        self._log("  No outline segments found to redraw — try lowering min segment length", "warn")
+                    else:
+                        self._log(f"  Redrawn {n_drawn} segment(s), {n_px2} px painted", "good")
+
                 out_name = Path(p).stem + "_processed.png"
                 result.save(out_dir / out_name)
                 self._log(f"✓  {Path(p).name}", "good")
@@ -1259,3 +1614,4 @@ if __name__ == "__main__":
         print("Tip: pip install tkinterdnd2  →  enables drag-and-drop")
     app = InpaintApp()
     app.mainloop()
+    # this is a test comment
